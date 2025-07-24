@@ -1,10 +1,9 @@
 # flashcard_gen.py --------------------------------------------------------
-import os, json, random, pathlib, sys
+import json, pathlib, logging
 from typing import List
 from openai import OpenAI
-import genanki
 
-print("in flashcard_gen")
+log = logging.getLogger(__name__)
 
 def get_client():
     from openai import OpenAI
@@ -76,50 +75,22 @@ Limit to {max_cards} cards.
     return cards
 
 # Call in _cards_from_chunk if using anki
-def build_deck(chunks: List[str], deck_name: str,
+def build_json(chunks: List[str], deck_name: str,
                max_cards_per_chunk: int = 3) -> pathlib.Path:
-    """Return Path to the generated .apkg file and also write a .cards.json file."""
+    """
+    Generate cards for *all* chunks, save <deck_name>.cards.json,
+    and return the Path.  No Anki deck, no TXT dump.
+    """
     all_cards: list[dict] = []
     for i, ch in enumerate(chunks, 1):
-        new_cards = _cards_from_chunk(ch, max_cards_per_chunk)
-        print(f"[flashcard_gen] Chunk {i}/{len(chunks)} → {len(new_cards)} card(s)")
-        all_cards.extend(new_cards)
-    total_cards = len(all_cards)
-    print(f"[flashcard_gen] Total cards generated: {total_cards}")
+        new = _cards_from_chunk(ch, max_cards_per_chunk)
+        log.info("Chunk %s/%s → %s card(s)", i, len(chunks), len(new))
+        all_cards.extend(new)
 
-    # --- JSON dump for Game 2 ---
     json_path = pathlib.Path(deck_name.replace(" ", "_") + ".cards.json")
-    json_path.write_text(json.dumps(all_cards, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("[flashcard_gen] Card JSON written →", json_path)
-
-    # --- Human‑readable TXT dump ------------------------------------------
-    txt_lines = []
-    for c in all_cards:
-        txt_lines.append("Q: " + c["front"])
-        txt_lines.append("A: " + c["back"])
-        txt_lines.append("CTX: " + c.get("context", ""))
-        txt_lines.append("EXCERPT: " + c.get("excerpt", "")[:200])
-        txt_lines.append("-" * 40)
-    txt_path = pathlib.Path(deck_name.replace(" ", "_") + ".cards.txt")
-    txt_path.write_text("\n".join(txt_lines), encoding="utf-8")
-    print("[flashcard_gen] Card TXT written →", txt_path)
-
-    deck = genanki.Deck(random.randrange(1<<30), deck_name[:90])
-    model = genanki.Model(
-        1537156452, "Basic",
-        fields=[{"name":"Front"},{"name":"Back"}],
-        templates=[{"name":"Card",
-                    "qfmt":"{{Front}}",
-                    "afmt":"{{Back}}<hr id=answer>"}],
+    json_path.write_text(
+        json.dumps(all_cards, ensure_ascii=False, indent=2),
+        encoding="utf-8"
     )
-    for c in all_cards:
-        # skip malformed card if GPT failed to supply two distractors
-        if len(c.get("distractors", [])) < 2:
-            continue
-        deck.add_note(genanki.Note(model, [c["front"], c["back"]]))
-
-
-    out = pathlib.Path(deck_name.replace(" ", "_") + ".apkg")
-    genanki.Package(deck).write_to_file(out)
-    print("[flashcard_gen] Deck written →", out.resolve())
-    return out
+    log.info("Card JSON written → %s  (total %s cards)", json_path, len(all_cards))
+    return json_path
