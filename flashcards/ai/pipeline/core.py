@@ -1,71 +1,45 @@
 """
-core.py – library functions, no user prompts
-PDF / DOCX / TXT  → chunks → cards → .json +.txt +.apkg
+core.py – library helpers for Django views
 """
-
 from __future__ import annotations
-import random, pathlib, pickle, logging
+import pathlib, random, pickle, logging
 from typing import List
+from ..driver import run_extraction
+from ..flashcard_gen import build_json, _cards_from_chunk
 
-from driver import run_extraction           # your existing helpers
-from flashcard_gen import build_deck        # unchanged
-from flashcard_gen import _cards_from_chunk
-                                            # used for JSON‑only mode
+log = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)           # <- replace prints
 
-# --------------------------------------------------------------------
-def run_pdf_to_cards(
+def cards_from_document(
     path: pathlib.Path,
     *,
     max_tokens: int = 900,
-    max_cards_per_chunk: int = 3,
+    cards_per_chunk: int = 3,
     sample_chunks: int | None = None,
-    cache: bool = True,
-) -> list[dict]:
-    """
-    Return **list of card‑dicts** for a single document.
-
-    No user interaction, no printing.
-    """
-    log.info("Extracting %s", path)
+    cache_chunks: bool = True,
+) -> List[dict]:
     chunks = run_extraction(path, max_tokens=max_tokens)
-
     if sample_chunks:
         chunks = random.sample(chunks, min(sample_chunks, len(chunks)))
-        log.info("Sampling %s random chunks", len(chunks))
+        log.info("Sampling %s random chunk(s)", len(chunks))
 
-    if cache:
-        cache_path = path.with_suffix(".chunks.pkl")
-        cache_path.write_bytes(pickle.dumps(chunks))
-        log.info("Chunks cached → %s", cache_path.name)
+    if cache_chunks:
+        path.with_suffix(".chunks.pkl").write_bytes(pickle.dumps(chunks))
 
-    # generate cards JSON only (no Anki deck)
     cards: list[dict] = []
     for ch in chunks:
-        cards.extend(_cards_from_chunk(ch, max_cards_per_chunk))
-
+        cards.extend(_cards_from_chunk(ch, cards_per_chunk))
     return cards
 
 
-# --------------------------------------------------------------------
-def build_deck_files(
+def write_json_for_document(
     path: pathlib.Path,
     *,
     max_tokens: int = 900,
-    max_cards_per_chunk: int = 3,
+    cards_per_chunk: int = 3,
     sample_chunks: int | None = None,
-) -> tuple[pathlib.Path, pathlib.Path]:
-    """
-    Full pipeline helper used by CLI:
-    returns (deck_path, json_path).
-    """
+) -> pathlib.Path:
     chunks = run_extraction(path, max_tokens=max_tokens)
     if sample_chunks:
         chunks = random.sample(chunks, min(sample_chunks, len(chunks)))
-
-    deck_name = path.stem + ("_TEST" if sample_chunks else "")
-    deck_path = build_deck(chunks, deck_name, max_cards_per_chunk)
-    json_path = deck_path.with_suffix(".cards.json")
-
-    return deck_path, json_path
+    return build_json(chunks, deck_name=path.stem, max_cards_per_chunk=cards_per_chunk)

@@ -1,7 +1,9 @@
+# flashcards/urls.py
 from django.urls import path
-from . import api_views
+from . import views
 
 urlpatterns = [
-    path("hand/",     api_views.hand,     name="hand"),
-    path("feedback/", api_views.feedback, name="feedback"),
+    path("generate/", views.generate_deck, name="generate_deck"),
+    path("hand/",      views.hand,         name="hand"),
+    path("feedback/",  views.feedback,     name="feedback"),
 ]

@@ -5,7 +5,7 @@ os.environ.setdefault("OPENAI_API_KEY", config("OPENAI_API_KEY"))
 import json
 # from prompt_cards import generate_from_prompt
 # from ingest import extract_text
-from pipeline import game
+from flashcards.ai import game
 import subprocess
 
 

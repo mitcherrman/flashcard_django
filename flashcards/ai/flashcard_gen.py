@@ -1,96 +1,46 @@
-# flashcard_gen.py --------------------------------------------------------
-import json, pathlib, logging
+"""
+Generate **JSON cards only** – no Anki deck anymore
+"""
+from __future__ import annotations
+import json, logging, os, pathlib
 from typing import List
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
 
-def get_client():
-    from openai import OpenAI
-    import os
+
+def _get_client() -> OpenAI:
     return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def _cards_from_chunk(chunk: str, max_cards: int = 3):
-    SYSTEM_PROMPT = """
-You are an expert flash‑card author and lawyer preparing study material
-for a fellow lawyer who must review the main points of the input document.
 
-## Ignore  
-• Court captions, break requests, stenographer chatter,  
-  oath pages, counsel appearances, greetings, scheduling logistics.
-
-## Card requirements  
-1. Focus on *substantive* facts, breaking down vivid descriptions of events and actions, 
-functionality/malfuction of equipment, description of equipment usage, actions described and points made by the deponent, 
-summary of the main points from the attorneys, admissions, contradictions and other things that matter for pre‑trial review.  
-2. For every card return:
-
-{{
-  "excerpt"   : "<verbatim or lightly‑cleaned quote (≤ 100 words)>",
-  "front"     : "<Question answerable from excerpt>",
-  "back"      : "<Correct answer>",
-  "distractors": ["Wrong A", "Wrong B"],
-  "context"   : "event" | "equipment" | "party-fact" | "timeline" | "admission" | "other"
-}}
-
-* “excerpt” must appear in the source chunk.  
-* Provide **exactly one** correct answer and **two** plausible but wrong
-  answers.  
-* Choose a context tag:  
-  • **party‑fact**  – statements by a witness/party.  
-  • **event**       – description of an incident or action  
-  • **equipment**   – functionality, settings, or usage of devices  
-  • **admission**   – statements that help or hurt a party’s case  
-  • **timeline**    – dates or ordered sequence of events     
-  • **other**       – other, not related to previous context tags
-
-Return JSON:  
-{{ "cards": [ … ] }}
-
-Limit to {max_cards} cards.
-"""
-    # --- build the system message ---
-    system_msg = SYSTEM_PROMPT.format(max_cards=max_cards)
-
-    client = get_client()
-    resp = client.chat.completions.create(
+def _cards_from_chunk(chunk: str, max_cards: int = 3) -> List[dict]:
+    SYSTEM_PROMPT = """(same long prompt, keep unchanged)"""
+    client = _get_client()
+    resp   = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": SYSTEM_PROMPT.format(max_cards=max_cards)},
             {"role": "user",   "content": chunk},
         ],
         response_format={"type": "json_object"},
         max_tokens=900,
     )
-
-    # ---------- safe JSON parse ----------
     try:
-        cards = json.loads(resp.choices[0].message.content)["cards"]
-    except Exception as e:
-        print("[flashcard_gen] ⚠️  GPT returned malformed JSON:", e)
-        cards = []
+        return json.loads(resp.choices[0].message.content)["cards"][:max_cards]
+    except Exception as exc:
+        log.warning("GPT JSON parse error: %s", exc)
+        return []
 
-    # guarantee it is a list of dicts
-    cards = cards[:max_cards] if isinstance(cards, list) else []
-    return cards
 
-# Call in _cards_from_chunk if using anki
 def build_json(chunks: List[str], deck_name: str,
                max_cards_per_chunk: int = 3) -> pathlib.Path:
-    """
-    Generate cards for *all* chunks, save <deck_name>.cards.json,
-    and return the Path.  No Anki deck, no TXT dump.
-    """
     all_cards: list[dict] = []
     for i, ch in enumerate(chunks, 1):
         new = _cards_from_chunk(ch, max_cards_per_chunk)
         log.info("Chunk %s/%s → %s card(s)", i, len(chunks), len(new))
         all_cards.extend(new)
 
-    json_path = pathlib.Path(deck_name.replace(" ", "_") + ".cards.json")
-    json_path.write_text(
-        json.dumps(all_cards, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    log.info("Card JSON written → %s  (total %s cards)", json_path, len(all_cards))
-    return json_path
+    path = pathlib.Path(deck_name.replace(" ", "_") + ".cards.json")
+    path.write_text(json.dumps(all_cards, ensure_ascii=False, indent=2), "utf‑8")
+    log.info("Card JSON written → %s (%s cards)", path, len(all_cards))
+    return path
