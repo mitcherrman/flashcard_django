@@ -1,68 +1,104 @@
 # flashcards/views.py
 from __future__ import annotations
-import pathlib, tempfile, logging, random
 
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly
-from rest_framework.response import Response
-from rest_framework import status
+import logging
+import pathlib
+import random
+import tempfile
+from typing import Any
 
-from django.db.models import F
 from django.core.files.uploadedfile import UploadedFile
+from django.db.models import F
+from django.http import JsonResponse
+from rest_framework import status
+from rest_framework.decorators import (
+    api_view,
+    parser_classes,
+    permission_classes,
+)
+from rest_framework.parsers import FormParser, MultiPartParser
+from rest_framework.permissions import IsAuthenticated, IsAuthenticatedOrReadOnly, AllowAny
+from rest_framework.response import Response
 
-from .models import Deck, Card
+from .ai.pipeline import core
+from .models import Card, Deck
 from .serializers import CardSerializer
-from .ai.pipeline import core                           # ← new clean library
 
 log = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------ #
-# 1.  Upload a deposition & generate cards (Game‑agnostic)           #
-# ------------------------------------------------------------------ #
+# --------------------------------------------------------------------------- #
+# 1)  /api/flashcards/generate/  – upload a file → create deck                #
+# --------------------------------------------------------------------------- #
+# flashcards/views.py   (replace generate_deck with this version)
+# --------------------------------------------------------------------------- #
+# 1)  /api/flashcards/generate/  – upload a file → create deck                #
+# --------------------------------------------------------------------------- #
+from traceback import print_exc                  #  ← NEW
+
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])                  # keep public for now
 def generate_deck(request):
     """
-    POST multipart/form‑data:
-      file        – PDF / DOCX / TXT
-      deck_name   – optional
+    POST multipart/form-data  { file, deck_name? }
 
-    Response: { deck_id, cards_created }
+    Success → 201 { deck_id, cards_created }
+    Failure → 4xx / 5xx  with { detail }
     """
-    up: UploadedFile = request.FILES.get("file")
-    if not up:
-        return Response({"detail": "file field required"},
-                        status=status.HTTP_400_BAD_REQUEST)
+    log.info("FILES: %s", request.FILES)
+
+    up: UploadedFile | None = request.FILES.get("file")
+    if up is None:
+        return Response({"detail": "file field required"}, status=400)
 
     deck_name = request.POST.get("deck_name", up.name)
-    # --- save upload to tmp and run pipeline ------------------------
-    with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(up.name).suffix) as tmp:
-        for chunk in up.chunks():
-            tmp.write(chunk)
+
+    try:
+        # 1) save the upload to a temp file ---------------------------------
+        with tempfile.NamedTemporaryFile(delete=False,
+                                         suffix=pathlib.Path(up.name).suffix) as tmp:
+            for chunk in up.chunks():
+                tmp.write(chunk)
         tmp_path = pathlib.Path(tmp.name)
+        log.info("Temp saved → %s (%s bytes)", tmp_path, tmp_path.stat().st_size)
 
-    cards = core.cards_from_document(tmp_path, cards_per_chunk=3)
-    log.info("Generated %s cards from %s", len(cards), up.name)
+        # 2) GPT → cards ----------------------------------------------------
+        cards = core.cards_from_document(tmp_path, cards_per_chunk=3)
 
-    deck = Deck.objects.create(user=request.user, name=deck_name)
-    Card.objects.bulk_create([
-        Card(deck=deck, front=c["front"], back=c["back"])
-        for c in cards
-    ])
-    return Response({"deck_id": deck.id, "cards_created": len(cards)})
+        if not cards:
+            raise RuntimeError("OpenAI returned zero cards "
+                               "(check API key / quota / model name)")
+
+        # 3) insert into DB -------------------------------------------------
+        user_obj = request.user if request.user.is_authenticated else None
+        deck = Deck.objects.create(user=user_obj, name=deck_name)
+        Card.objects.bulk_create(
+            [Card(deck=deck, front=c["front"], back=c["back"]) for c in cards]
+        )
+        return Response({"deck_id": deck.id,
+                         "cards_created": len(cards)}, status=201)
+
+    except Exception as exc:
+        log.exception("Deck build failed")
+        return Response(
+            {"detail": f"Deck build failed: {exc!s}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
-# ------------------------------------------------------------------ #
-# 2.  Hand endpoint for the RN client                                #
-# ------------------------------------------------------------------ #
+
+
+# --------------------------------------------------------------------------- #
+# 2)  /api/flashcards/hand/  – return *n* random cards for a deck             #
+# --------------------------------------------------------------------------- #
 @api_view(["GET"])
 @permission_classes([IsAuthenticatedOrReadOnly])
-def hand(request):
+def hand(request) -> Response:
     """
-    GET /api/flashcards/hand?deck_id=123&n=12
-    Returns up to *n* random cards.
-    If deck_id is omitted → random across all cards (demo).
+    GET parameters:
+
+      deck_id   – optional; if absent, sample across *all* cards (demo)
+      n         – optional, default = 12
     """
     n       = int(request.GET.get("n", 12))
     deck_id = request.GET.get("deck_id")
@@ -75,31 +111,39 @@ def hand(request):
     return Response(CardSerializer(sample, many=True).data)
 
 
-# ------------------------------------------------------------------ #
-# 3.  Feedback from the games                                        #
-# ------------------------------------------------------------------ #
+# --------------------------------------------------------------------------- #
+# 3)  /api/flashcards/feedback/  – increment right / wrong counters           #
+# --------------------------------------------------------------------------- #
 @api_view(["POST"])
 @permission_classes([IsAuthenticatedOrReadOnly])
-def feedback(request):
+def feedback(request) -> Response:
     """
-    React‑Native sends:
+    JSON body (any keys you need):
 
-    {
-      "right":  [card_id, …],     # answered correctly
-      "wrong":  [card_id, …],     # answered incorrectly
-      "kept":   [...],            # Game 1 keep
-      "tossed": [...]
-    }
-    Only the keys relevant to the current game are sent.
+        {
+          "right":  [ card_id, … ],
+          "wrong":  [ ... ],
+          "kept":   [ ... ],      # for Game 1
+          "tossed": [ ... ]
+        }
     """
-    data   = request.data or {}
-    right  = data.get("right", [])
-    wrong  = data.get("wrong", [])
+    data: dict[str, Any] = request.data or {}
+    right_ids  = data.get("right", [])
+    wrong_ids  = data.get("wrong", [])
 
-    if right:
-        Card.objects.filter(id__in=right).update(right=F("right") + 1)
-    if wrong:
-        Card.objects.filter(id__in=wrong).update(wrong=F("wrong") + 1)
+    if right_ids:
+        Card.objects.filter(id__in=right_ids).update(right=F("right") + 1)
+    if wrong_ids:
+        Card.objects.filter(id__in=wrong_ids).update(wrong=F("wrong") + 1)
 
-    log.debug("Feedback received: %s", data)
+    log.debug("✅ feedback %s", data)
     return Response({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# 4)  /api/flashcards/health  – simple health‑check (no auth)                 #
+# --------------------------------------------------------------------------- #
+@api_view(["GET"])
+@permission_classes([])                     # public
+def health(_request):
+    return JsonResponse({"ok": True})
