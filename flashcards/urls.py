@@ -8,7 +8,7 @@ urlpatterns = [
     path("generate/", views.generate_deck, name="generate_deck"),
     path("hand/",      views.hand,         name="hand"),
     path("feedback/",  views.feedback,     name="feedback"),
-
+    path("flashcards/sessions/", views.session_history),
     # simple health‑check – reachable at /api/flashcards/health
     path("health/", lambda r: JsonResponse({"ok": True}), name="health"),
 ]
