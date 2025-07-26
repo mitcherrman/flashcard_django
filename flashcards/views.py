@@ -147,3 +147,23 @@ def feedback(request) -> Response:
 @permission_classes([])                     # public
 def health(_request):
     return JsonResponse({"ok": True})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+# GET /api/flashcards/sessions/
+def session_history(request):
+    user_decks = Deck.objects.filter(user = request.user).order_by("-created")
+    
+    sessions = []
+    for deck in user_decks:
+        sessions.append({
+            "deck_id": deck.id,
+            "name": deck.name,
+            "created": deck.created,
+            "source_type": deck.source.source_type if deck.source else None,
+            "prompt_text": deck.source.prompt_text if deck.source else None,
+            "num_cards": deck.cards.count()
+        })
+    return Response(sessions)
+
