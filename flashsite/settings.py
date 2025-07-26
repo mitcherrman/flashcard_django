@@ -157,9 +157,20 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
+# ------------------------------------------------------------------
+# Logging – keep it super‑simple while developing
+# ------------------------------------------------------------------
 LOGGING = {
     "version": 1,
-    "handlers": {"console": {"class": "logging.StreamHandler"}},
-    "root": {"handlers": ["console"], "level": "INFO"},
+    "disable_existing_loggers": False,   # keep Django’s own warnings
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+        },
+    },
+    "root": {                # <- anything like logging.info(...)
+        "handlers": ["console"],
+        "level": "DEBUG",     # DEBUG for even more noise
+    },
 }
+

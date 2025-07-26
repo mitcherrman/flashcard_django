@@ -10,7 +10,7 @@ log = logging.getLogger(__name__)
 enc = tiktoken.encoding_for_model("gpt-4o-mini")   # falls back if unknown
 
 
-def make_chunks(text: str, max_tokens: int = 900) -> List[str]:
+def make_chunks(text: str, max_tokens: int = 500) -> List[str]:
     paragraphs = text.split("\n\n")
     chunks, buf, tally = [], [], 0
 

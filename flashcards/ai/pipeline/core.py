@@ -16,7 +16,7 @@ from ..driver         import run_extraction
 from ..flashcard_gen  import _cards_from_chunk               # <- only this
 
 log = logging.getLogger(__name__)
-
+print("pipeline.core 0.0")
 
 # --------------------------------------------------------------------------- #
 # 1)  High‑level helper used by the Django view                               #
@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 def cards_from_document(
     path: pathlib.Path,
     *,
-    max_tokens: int        = 900,
+    max_tokens: int        = 500,
     cards_per_chunk: int   = 3,
     sample_chunks: int | None = None,
     cache_chunks: bool     = True,
@@ -49,14 +49,14 @@ def cards_from_document(
         cards.extend(_cards_from_chunk(ch, cards_per_chunk))
     return cards
 
-
+print("pipeline.core 1.0")
 # --------------------------------------------------------------------------- #
 # 2)  Convenience helper – not used by Django views, but kept for CLI/tests   #
 # --------------------------------------------------------------------------- #
 def write_json_for_document(
     path: pathlib.Path,
     *,
-    max_tokens: int      = 900,
+    max_tokens: int      = 500,
     cards_per_chunk: int = 3,
     sample_chunks: int | None = None,
 ) -> pathlib.Path:
@@ -72,6 +72,8 @@ def write_json_for_document(
         cache_chunks=False,
     )
     out = path.with_suffix(".cards.json")
+    print("pipeline.core 1.5")
     out.write_text(json.dumps(cards, ensure_ascii=False, indent=2), encoding="utf‑8")
+    print("pipeline.core 1.6")
     log.info("Card JSON written → %s (%s cards)", out.name, len(cards))
     return out
