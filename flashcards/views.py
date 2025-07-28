@@ -54,6 +54,12 @@ def generate_deck(request):
     deck_name = request.POST.get("deck_name", up.name)
 
     try:
+        cards_wanted = int(request.POST.get("cards_wanted", 12))
+        cards_wanted = max(3, min(cards_wanted, 30))  # clamp 3‑30
+    except ValueError:
+        cards_wanted = 12
+
+    try:
         # 1) save the upload to a temp file ---------------------------------
         with tempfile.NamedTemporaryFile(delete=False,
                                          suffix=pathlib.Path(up.name).suffix) as tmp:
@@ -64,6 +70,17 @@ def generate_deck(request):
 
         # 2) GPT → cards ----------------------------------------------------
         cards = core.cards_from_document(tmp_path, cards_per_chunk=3)
+
+        if len(cards) >= cards_wanted:
+            cards = cards[:cards_wanted]
+        else:
+            cards = cards * (cards_wanted // len(cards)) + cards[: cards_wanted % len(cards)]
+
+        if not cards:
+            raise RuntimeError(
+                "OpenAI returned zero cards "
+                "(check API key / quota / model name)"
+            )        
 
         if not cards:
             raise RuntimeError("OpenAI returned zero cards "
