@@ -45,8 +45,15 @@ def cards_from_document(
         log.debug("Chunk cache written → %s", cache.name)
 
     cards: list[dict] = []
-    for ch in chunks:
-        cards.extend(_cards_from_chunk(ch, cards_per_chunk))
+    for chunk_txt, page in chunks:            # now a tuple
+        cards.extend(
+            _cards_from_chunk(
+                chunk_txt,
+                page_no=page,
+                max_cards=cards_per_chunk,
+            )
+        )
+
     return cards
 
 print("pipeline.core 1.0")

@@ -90,8 +90,18 @@ def generate_deck(request):
         user_obj = request.user if request.user.is_authenticated else None
         deck = Deck.objects.create(user=user_obj, name=deck_name)
         Card.objects.bulk_create(
-            [Card(deck=deck, front=c["front"], back=c["back"]) for c in cards]
+            [
+                Card(
+                    deck=deck,
+                    front=c["front"],
+                    back=c["back"],
+                    excerpt=c.get("excerpt", "")[:500],
+                    page=c.get("page"),                
+                )
+                for c in cards
+            ]
         )
+
         return Response({"deck_id": deck.id,
                          "cards_created": len(cards)}, status=201)
 

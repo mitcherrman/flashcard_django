@@ -1,35 +1,41 @@
-# ingest.py  – safe for str or pathlib.Path
+# flashcards/ai/ingest.py
 """
-Turn PDFs, Word docs, or images into plain-text strings.
+ingest.py – read a PDF / DOCX / TXT and return
+List[Tuple[str, int]] →  [(page_text, page_no), …]
 """
+from __future__ import annotations
 from pathlib import Path
-import fitz          # PyMuPDF
-import docx          # python-docx
-# import pytesseract
-# from PIL import Image
+from typing import List, Tuple
+import logging
+import fitz  #  PyMuPDF
 
-print("in ingest")
+log = logging.getLogger(__name__)
 
-def extract_text(path) -> str:
+
+def extract_text(path: Path) -> List[Tuple[str, int]]:
     """
-    Accepts str or pathlib.Path.  Detects file type by extension,
-    extracts visible text, and returns one big string.
+    Extract every page with PyMuPDF.
+
+    Returns
+    -------
+    list[tuple[str, int]]
+        e.g.  [("First page text …", 1),
+               ("Second page text …", 2),
+               …]
+    Raises
+    ------
+    RuntimeError
+        If the file type is unsupported or PyMuPDF fails.
     """
-    p = Path(path)            # normalise to Path object
-    suffix = p.suffix.lower() # '.pdf', '.docx', '.png', ...
+    if path.suffix.lower() != ".pdf":
+        raise RuntimeError("Only .pdf files supported in this ingest module")
 
-    if suffix == ".pdf":                              # ── PDF
-        with fitz.open(p) as pdf:
-            return "\n".join(page.get_text() for page in pdf)
+    pages: list[tuple[str, int]] = []
+    with fitz.open(path) as doc:
+        for page_no in range(doc.page_count):
+            page = doc.load_page(page_no)
+            text = page.get_text("text")          # “text” = simple UTF‑8
+            pages.append((text.strip(), page_no + 1))
 
-    elif suffix in {".docx", ".doc"}:                 # ── DOCX
-        doc = docx.Document(p)
-        return "\n".join(par.text for par in doc.paragraphs)
-
-    # elif suffix in {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}:  # ── Image
-    #     img = Image.open(p)
-    #     return pytesseract.image_to_string(img)
-    elif suffix == ".txt":                         # ── Plain text
-        return p.read_text(encoding="utf-8", errors="ignore")
-
-    raise ValueError(f"Unsupported file type: {suffix}")
+    log.info("ingest → %s page(s) from %s", len(pages), path.name)
+    return pages
