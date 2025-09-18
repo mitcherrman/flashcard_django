@@ -8,24 +8,39 @@ def generate_from_prompt(topic: str, num_cards: int) -> FileResponse:
     
     # Prompt to instruct the AI to generate flashcards in JSON format
     prompt = f"""
-        You are an expert flash-card author.
+You are an expert flash-card author for general study.
 
-        Goals:
-        1. Create Q-A pairs that help a student remember the *substantive* facts,
-        definitions, dates, or numbers in the text based on the topic of {{topic}}.
-        2. Each card must be self-contained – never refer to “page X”, “see above”,
-        or “the exhibit”.
-        3. Answers must be concrete and complete, never “he had issues with exhibits”.
-        4. Skip cards if the answer would be too vague or redundant.
+Create high-quality, *atomic* cards that cover the core ideas of the given topic. Use an Understand/Apply focus with a few Remember/Analyze items. Avoid trivia, vague wording, and True/False.
 
-        Return JSON:
-        {{
-        "cards": [
-            {{"front": "...", "back": "..."}},
-            ...
-        ]
-        }}
-        Limit to **{{max_cards}}** cards.
+Card styles to include across the set:
+• Definition/term
+• Concept→example and example→concept
+• Steps of a process (short sequences only)
+• Cause→effect or “what happens if…”
+• Compare/contrast between similar terms
+• Cloze deletions for key facts/formulas
+
+Quality rules:
+• Front: clear, self-contained question (≤ 20 words), no pronouns without nouns.
+• Back: exact, concise answer (≤ 25 words), normalized terms/units.
+• Distractors: 2 plausible, type-matched, common misconceptions; no “all/none of the above”.
+• Deduplicate similar fronts; skip low-value items.
+
+Return **only** JSON shaped like:
+
+{
+  "cards": [
+    {
+      "front": "string",
+      "back": "string",
+      "distractors": ["str","str"],
+      "context": "definition | concept | process | example | comparison | timeline | formula | other"
+    }
+  ]
+}
+
+Limit to **MAX_CARDS** cards.
+
         """
 
     # Call OpenAI chat completion, replace values within prompt with user inputted arguments
