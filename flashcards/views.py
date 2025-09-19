@@ -69,7 +69,14 @@ def generate_deck(request):
         log.info("Temp saved → %s (%s bytes)", tmp_path, tmp_path.stat().st_size)
 
         # 2) GPT → cards ----------------------------------------------------
-        cards = core.cards_from_document(tmp_path, cards_per_chunk=3)
+        cards = core.cards_from_document(
+            tmp_path,
+            total_cards=cards_wanted,                   # ← from POST
+            max_cards_per_chunk=min(3, cards_wanted),   # per-page ceiling
+            max_tokens=500,
+            sample_chunks=(None),              # keep your test mode, optional
+            )
+
 
         if len(cards) >= cards_wanted:
             cards = cards[:cards_wanted]
