@@ -3,12 +3,5 @@ from .models import Card
 
 class CardSerializer(serializers.ModelSerializer):
     class Meta:
-        model  = Card
-        fields = (
-            "id",
-            "front",
-            "back",
-            "excerpt",      # make them available to the RN app
-            "context",
-            "page",
-        )
+        model = Card
+        fields = ["id", "front", "back", "excerpt", "page", "section", "context", "right", "wrong"]

@@ -1,7 +1,7 @@
 # flashcards/ai/flashcard_gen.py
 from __future__ import annotations
 import json, logging
-from typing import List
+from typing import List, Optional
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
@@ -10,6 +10,9 @@ SYSTEM_PROMPT = """
 You are an expert flash-card author for general study materials.
 
 Create high-quality, *atomic* cards (one fact/idea each) that help a learner recall and apply core concepts from the given text chunk. Avoid vague wording, pronouns without clear referents, trivial copies of headings, and True/False.
+
+If a SECTION name is provided, ensure each card includes a `"section"` field
+with exactly that string.
 
 Card types to mix: definition/term, concept→example, example→concept, steps of a process, cause→effect, compare/contrast, cloze (fill-in-the-blank), light recall of dates/formulas where central. Prefer Understand/Apply levels, with a few Remember/Analyze.
 
@@ -34,6 +37,7 @@ Return **only** a JSON object exactly in this schema and nothing else:
       "distractors": ["str","str"],
       "context": "definition | concept | process | example | comparison | timeline | formula | other",
       "page": 12
+      "section": "string"
     }
   ]
 }
@@ -45,39 +49,43 @@ Max items in "cards": MAX_CARDS
 def _cards_from_chunk(
     chunk_text: str,
     page_no: int,
+    section: Optional[str] = None,
     max_cards: int = 3,
 ) -> List[dict]:
-    """
-    • Adds PAGE N prefix so GPT knows the origin.
-    • Guarantees each card has "page".
-    • Returns [] on any failure.
-    """
     prompt = SYSTEM_PROMPT.replace("MAX_CARDS", str(max_cards))
-    client = OpenAI()                      # needs OPENAI_API_KEY in env
+    client = OpenAI()
+
+    user_blob = f"PAGE: {page_no}\n"
+    if section:
+        user_blob += f"SECTION: {section}\n"
+    user_blob += "\nTEXT:\n" + chunk_text
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": f"PAGE {page_no}\n\n{chunk_text}",
-            },
+            {"role": "user",   "content": user_blob},
         ],
         response_format={"type": "json_object"},
         max_tokens=900,
     )
 
     raw = resp.choices[0].message.content
-    log.debug("OpenAI raw content (page %s)… %s", page_no, raw[:400])
+    log.debug("OpenAI raw content (page %s, section=%r)… %s", page_no, section, raw[:400])
 
     try:
         cards = json.loads(raw)["cards"]
     except Exception as exc:
-        log.warning("GPT JSON parse failed on page %s: %s", page_no, exc)
+        log.warning("GPT JSON parse failed on page %s: %s", page_no, exc)
         return []
 
-    #  guarantee page number
+    if not isinstance(cards, list):
+        return []
+
+    # Guarantee metadata
     for c in cards:
         c.setdefault("page", page_no)
-    return cards[:max_cards] if isinstance(cards, list) else []
+        if section:
+            c.setdefault("section", section)
+
+    return cards[:max_cards]

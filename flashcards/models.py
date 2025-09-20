@@ -19,3 +19,6 @@ class Card(models.Model):
 
     right = models.IntegerField(default=0)
     wrong = models.IntegerField(default=0)
+
+    section = models.CharField(max_length=200, null=True, blank=True)
+

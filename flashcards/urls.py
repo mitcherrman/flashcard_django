@@ -1,16 +1,17 @@
 # flashcards/urls.py
 from django.urls import path
-from django.http import JsonResponse
 from . import views
 
 urlpatterns = [
-    # builder / game API
-    path("generate/", views.generate_deck, name="generate_deck"),
-    path("hand/",      views.hand,         name="hand"),
-    path("feedback/",  views.feedback,     name="feedback"),
+    # New quick analysis endpoint
+    path("analyze/",  views.analyze,       name="analyze"),
 
-    # simple health‑check – reachable at /api/flashcards/health
-    path("health/", lambda r: JsonResponse({"ok": True}), name="health"),
+    # Back-compat alias (optional): keep old /inspect/ working
+    path("inspect/",  views.analyze,       name="inspect"),
 
-     path("inspect/", views.inspect_upload),
+    # Deck building + gameplay
+    path("generate/", views.generate_deck, name="generate"),
+    path("hand/",     views.hand,          name="hand"),
+    path("feedback/", views.feedback,      name="feedback"),
+    path("health/",   views.health,        name="health"),
 ]
