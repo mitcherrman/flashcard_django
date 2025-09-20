@@ -181,3 +181,68 @@ def feedback(request) -> Response:
 @permission_classes([])                     # public
 def health(_request):
     return JsonResponse({"ok": True})
+
+
+# flashcards/views.py (add imports if missing)
+import re
+import tempfile
+from pathlib import Path
+import fitz  # PyMuPDF
+
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+
+@api_view(["POST"])
+@permission_classes([AllowAny])   # keep public; it's only metadata
+def inspect_upload(request):
+    """
+    POST multipart/form-data { file }
+    → 200 { ok, pages, words, chars, bytes, avg_words_per_page }
+    Quick, non-blocking inspection; no DB writes.
+    """
+    up = request.FILES.get("file")
+    if not up:
+        return Response({"detail": "file field required"}, status=400)
+
+    # Save to a temp file (PyMuPDF needs a real path)
+    with tempfile.NamedTemporaryFile(delete=False,
+                                     suffix=Path(up.name).suffix) as tmp:
+        for chunk in up.chunks():
+            tmp.write(chunk)
+    p = Path(tmp.name)
+
+    try:
+        doc = fitz.open(p.as_posix())
+        pages = doc.page_count
+
+        words = 0
+        chars = 0
+        word_rx = re.compile(r"\b[\w’'-]+\b", re.UNICODE)  # count words reasonably
+
+        for pg in doc:
+            txt = pg.get_text("text") or ""
+            chars += len(txt)
+            words += len(word_rx.findall(txt))
+
+        doc.close()
+
+        b = p.stat().st_size
+        avg_w = round(words / pages, 1) if pages else 0.0
+
+        return Response({
+            "ok": True,
+            "pages": pages,
+            "words": words,
+            "chars": chars,
+            "bytes": b,
+            "avg_words_per_page": avg_w,
+        })
+
+    except Exception as e:
+        return Response({"ok": False, "detail": str(e)}, status=500)
+    finally:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass

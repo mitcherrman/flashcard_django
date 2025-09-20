@@ -11,4 +11,6 @@ urlpatterns = [
 
     # simple health‑check – reachable at /api/flashcards/health
     path("health/", lambda r: JsonResponse({"ok": True}), name="health"),
+
+     path("inspect/", views.inspect_upload),
 ]
