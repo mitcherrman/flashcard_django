@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging, pathlib, random, tempfile
-from typing import Any
+from typing import Any, Dict, List
 
 from django.core.files.uploadedfile import UploadedFile
 from django.db.models import F
@@ -55,11 +55,21 @@ def analyze(request):
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/generate/  – upload a file → create deck
 # ────────────────────────────────────────────────────────────────────────────
+def _spread_even(total: int, pages: List[int]) -> Dict[int, int]:
+    total = max(0, int(total))
+    if not pages:
+        return {}
+    base, extra = divmod(total, len(pages))
+    q = {}
+    for i, p in enumerate(pages):
+        q[p] = q.get(p, 0) + base + (1 if i < extra else 0)
+    return q
+
 @api_view(["POST"])
-@permission_classes([AllowAny])                  # keep public for now
+@permission_classes([AllowAny])
+@parser_classes([MultiPartParser, FormParser])
 def generate_deck(request):
     log.info("FILES: %s", request.FILES)
-
     up: UploadedFile | None = request.FILES.get("file")
     if up is None:
         return Response({"detail": "file field required"}, status=400)
@@ -67,14 +77,38 @@ def generate_deck(request):
     deck_name = request.POST.get("deck_name", up.name)
 
     try:
-        # slider clamp (3–30)
-        try:
-            cards_wanted = int(request.POST.get("cards_wanted", 30))
-        except ValueError:
-            cards_wanted = 30
-        cards_wanted = max(3, min(cards_wanted, 30))
+        cards_wanted = int(request.POST.get("cards_wanted", 12))
+    except ValueError:
+        cards_wanted = 12
+    cards_wanted = max(3, min(cards_wanted, 30))
 
-        # 1) save upload to temp file
+    # Parse optional per-section allocations
+    allocations = []
+    if request.POST.get("allocations"):
+        try:
+            allocations = json.loads(request.POST["allocations"]) or []
+        except Exception:
+            allocations = []
+
+    # Build per-page quotas from allocations
+    per_page_quotas: Dict[int, int] = {}
+    for a in allocations:
+        try:
+            c   = int(a.get("cards", 0))
+            p1  = int(a.get("page_start", 0))
+            p2  = int(a.get("page_end", 0))
+            if c > 0 and p1 >= 1 and p2 >= p1:
+                pages = list(range(p1, p2 + 1))
+                chunk = _spread_even(c, pages)
+                for pg, q in chunk.items():
+                    per_page_quotas[pg] = per_page_quotas.get(pg, 0) + q
+        except Exception:
+            continue
+
+    total_from_plan = sum(per_page_quotas.values()) if per_page_quotas else None
+    total_cards = max(3, min((total_from_plan or cards_wanted), 30))
+
+    try:
         with tempfile.NamedTemporaryFile(delete=False,
                                          suffix=pathlib.Path(up.name).suffix) as tmp:
             for chunk in up.chunks():
@@ -82,58 +116,34 @@ def generate_deck(request):
         tmp_path = pathlib.Path(tmp.name)
         log.info("Temp saved → %s (%s bytes)", tmp_path, tmp_path.stat().st_size)
 
-        # 2) generate cards
         cards = cards_from_document(
             tmp_path,
-            total_cards=cards_wanted,
-            max_cards_per_chunk=min(3, cards_wanted),
+            total_cards=total_cards,
+            max_cards_per_chunk=30,
             max_tokens=500,
+            per_page_quotas=per_page_quotas or None,
         )
-
-        # Fallback pad (rare)
-        if len(cards) < cards_wanted and len(cards) > 0:
-            need = cards_wanted - len(cards)
-            cards = cards + (cards * (need // len(cards))) + cards[: need % len(cards)]
-        cards = cards[:cards_wanted]
 
         if not cards:
             raise RuntimeError("OpenAI returned zero cards (check API key / quota / model name)")
 
-        # 2.5) If a card has a page but no section, infer section from PDF TOC
-        try:
-            import fitz  # PyMuPDF
-            doc = fitz.open(tmp_path.as_posix())
-            pages = doc.page_count
-            toc = doc.get_toc() or []           # [[level, title, page], ...] (page is 1-based)
-            # build page→section map
-            flat = [{"title": t, "page_start": p} for (lvl, t, p) in toc if 1 <= p <= pages]
-            flat.sort(key=lambda x: x["page_start"])
-            ranges = []
-            for i, s in enumerate(flat):
-                start = s["page_start"]
-                end   = (flat[i+1]["page_start"] - 1) if i + 1 < len(flat) else pages
-                ranges.append((start, end, s["title"]))
-            doc.close()
+        # Annotate section from allocations (by page range), if present
+        def section_for_page(p: int) -> str | None:
+            for a in allocations:
+                try:
+                    if int(a.get("page_start", 0)) <= p <= int(a.get("page_end", 0)):
+                        return str(a.get("title") or "").strip() or None
+                except Exception:
+                    continue
+            return None
 
-            def section_for_page(pg: int | None) -> str | None:
-                if not pg:
-                    return None
-                for a, b, title in ranges:
-                    if a <= pg <= b:
-                        return title
-                return None
+        for c in cards:
+            p = c.get("page")
+            if p is not None and "section" not in c:
+                c["section"] = section_for_page(int(p))
 
-            for c in cards:
-                if not c.get("section"):
-                    c["section"] = section_for_page(c.get("page"))
-        except Exception as _e:
-            # non-fatal: if TOC missing or PyMuPDF not available, we just skip
-            pass
-
-        # 3) insert into DB  ⬇⬇⬇  (this is the block you asked about)
         user_obj = request.user if request.user.is_authenticated else None
         deck = Deck.objects.create(user=user_obj, name=deck_name)
-
         Card.objects.bulk_create([
             Card(
                 deck=deck,
@@ -141,8 +151,8 @@ def generate_deck(request):
                 back=c["back"],
                 excerpt=c.get("excerpt", "")[:500],
                 page=c.get("page"),
-                section=c.get("section") or None,    # NEW
-                context=c.get("context") or None,    # NEW
+                section=c.get("section") or None,
+                context=c.get("context") or "",
             )
             for c in cards
         ])
@@ -153,7 +163,7 @@ def generate_deck(request):
         log.exception("Deck build failed")
         return Response({"detail": f"Deck build failed: {exc!s}"},
                         status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+    
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/hand/  – return n random cards from a deck
 # ────────────────────────────────────────────────────────────────────────────
