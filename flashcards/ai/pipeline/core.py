@@ -1,10 +1,9 @@
-# flashcards/ai/pipeline/core.py
 """
 flashcards.ai.pipeline.core
 ———————————
 Pure-library helpers – **NO Django, NO prints**.
 
-• cards_from_document(path, …) → list[dict]   (for views.generate_deck)
+• cards_from_document(path, …) → list[dict]   (used by views.generate_deck)
 • write_json_for_document(path, …) → Path     (optional utility)
 """
 from __future__ import annotations
@@ -14,241 +13,236 @@ from collections import defaultdict
 
 from ..driver         import run_extraction
 from ..flashcard_gen  import _cards_from_chunk, build_card_key
+from .templater       import build_template_from_chunks
 
 log = logging.getLogger(__name__)
 
 # ───────────────────────── helpers ─────────────────────────
-def _pick_page_from(item_parts: List[Any], fallback: int) -> int:
-    page: Optional[int] = None
-    for elem in item_parts:
-        if isinstance(elem, int):
-            page = elem; break
-        if isinstance(elem, (tuple, list)) and len(elem) == 2 and all(isinstance(x, int) for x in elem):
-            page = elem[0]; break
-        if isinstance(elem, dict):
-            if "page" in elem and isinstance(elem["page"], int):
-                page = elem["page"]; break
-            if "page_start" in elem and isinstance(elem["page_start"], int):
-                page = elem["page_start"]; break
-    return int(page if page is not None else fallback)
 
 def _normalize_chunks(raw_chunks) -> List[Tuple[str, int]]:
+    """
+    Convert driver output into [(text, page)] in natural order.
+    Accepts tuples/lists/dicts/strings from the driver.
+    """
+    def _pick_page_from(item_parts: List[Any], fallback: int) -> int:
+        page: Optional[int] = None
+        for elem in item_parts:
+            if isinstance(elem, int):
+                page = elem; break
+            if isinstance(elem, (tuple, list)) and len(elem) == 2 and all(isinstance(x, int) for x in elem):
+                page = elem[0]; break
+            if isinstance(elem, dict):
+                if "page" in elem and isinstance(elem["page"], int):
+                    page = elem["page"]; break
+                if "page_start" in elem and isinstance(elem["page_start"], int):
+                    page = elem["page_start"]; break
+        return int(page if page is not None else fallback)
+
     norm: List[Tuple[str, int]] = []
     if not raw_chunks:
         return norm
+
     for idx, item in enumerate(raw_chunks, start=1):
         if isinstance(item, (tuple, list)) and item:
             txt = item[0]
             page = _pick_page_from(list(item[1:]), fallback=idx)
             norm.append((str(txt), page)); continue
         if isinstance(item, dict):
-            txt = item.get("text", "")
+            txt = item.get("text", "") or ""
             page = item.get("page") or item.get("page_start") or idx
             norm.append((str(txt), int(page))); continue
         norm.append((str(item), idx))
     return norm
 
+
 def _distribute_quota(total: int, parts: int) -> list[int]:
     if parts <= 0:
         return []
-    base, extra = divmod(total, parts)
+    base, extra = divmod(max(0, int(total)), parts)
     return [base + (1 if i < extra else 0) for i in range(parts)]
 
-# Heuristic “fact” counter (bullets, equations, definitions, short atomic sentences)
-_BULLET = re.compile(r"^\s*(?:[-*•]|[0-9]+[.)])\s+")
-_EQUATION = re.compile(r"[=≈≃≥≤±∝^]")
-_DEF = re.compile(r"\b(is defined as|means|refers to|defined as|:)\b", re.I)
 
-def _estimate_facts(text: str) -> int:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    score = 0
-    for ln in lines:
-        if _BULLET.search(ln):
-            score += 1; continue
-        if _EQUATION.search(ln):
-            score += 1; continue
-        if _DEF.search(ln):
-            score += 1; continue
-        # compact “atomic” sentence
-        if ln.endswith("."):
-            tokens = ln.split()
-            if 6 <= len(tokens) <= 24:
-                score += 1
-    return max(1, score)  # always allow at least 1
+def _norm(s: str) -> str:
+    """Loose normalization for fuzzy title matching."""
+    s = (s or "").lower()
+    s = re.sub(r"[\s\u200b]+", " ", s)
+    s = re.sub(r"[^\w\s&:+/().,'’\-^*=\[\]{}|]", "", s)
+    return s.strip()
+
+
+# ───────────────── item → short text payload ─────────────────
+
+def _text_for_item(item: dict, section_title: str) -> str:
+    t = (item.get("type") or "").lower()
+    ex = item.get("source_excerpt") or ""
+    if t == "definition":
+        term = item.get("term") or ""
+        definition = item.get("definition") or ""
+        if term and definition:
+            return f"{term}: {definition}"
+        return ex or definition or term
+    if t == "formula":
+        name = item.get("name") or "Formula"
+        expr = item.get("expression") or ""
+        return f"{name}: {expr}" if expr else (ex or name)
+    if t == "example":
+        prompt = item.get("prompt") or ""
+        sol = item.get("solution") or ""
+        return f"Example: {prompt}" + (f" = {sol}" if sol else "")
+    if t == "concept":
+        term = item.get("term") or ""
+        definition = item.get("definition") or ""
+        if term and definition:
+            return f"{term}: {definition}"
+        return definition or term or ex
+    # fallback
+    return ex or f"{section_title} – key point"
+
 
 # ───────────────────── public API ──────────────────────────
+
 def cards_from_document(
     path: pathlib.Path,
     *,
     # global control
-    total_cards: int | None = None,
-    max_cards_per_chunk: int = 30,
+    total_cards: int | None = None,           # optional overall cap (still respects per-section caps)
+    max_cards_per_section: int = 8,           # NEW default hard cap per section
     # extraction / testing
     max_tokens: int = 500,
     sample_chunks: int | None = None,
     cache_chunks: bool = True,
-    # quotas & sections
-    per_page_section_quotas: Optional[Dict[int, List[tuple[str,int]]]] = None,  # NEW
-    per_page_quotas: Optional[Dict[int, int]] = None,                            # legacy
-    page_to_section: Optional[Dict[int, str]] = None,                            # legacy
-    section_caps: Optional[Dict[str, int]] = None,
-    autoguess_section_caps: bool = True,
+    # UI plan (section → requested #cards). Titles must match user UI.
+    sections_plan: Optional[List[Dict[str, Any]]] = None,  # [{title,page_start,page_end,cards}]
 ) -> List[dict]:
+    """
+    Turn a document into list[card-dict] using the Study Template.
+
+    Behavior:
+      • Build a template (heading→next heading; items inside).
+      • For each section, try to generate as many *unique* cards as possible
+        up to min(requested, max_cards_per_section). If no plan is provided:
+          – if total_cards is set: distribute across sections and cap per section
+          – else: aim for max_cards_per_section for every section
+      • Output is in *document order* (by item ordinal; then page; then sequence).
+    """
     raw = run_extraction(path, max_tokens=max_tokens)
-    chunks = _normalize_chunks(raw)                      # -> [(text, page)]
+    chunks = _normalize_chunks(raw)  # -> [(text, page)]
     log.info("core: %s chunk(s) ready", len(chunks))
 
     if sample_chunks:
         k = min(sample_chunks, len(chunks))
         chunks = random.sample(chunks, k)
+        log.debug("Sampled %s random chunk(s) for test/demo", len(chunks))
 
     if cache_chunks:
         cache = path.with_suffix(".chunks.pkl")
         try:
             cache.write_bytes(pickle.dumps(chunks))
+            log.debug("Chunk cache written → %s", cache.name)
         except Exception as e:
             log.warning("Could not write chunk cache %s: %s", cache, e)
 
-    # combine text per page (if multiple chunks per page, join them)
-    from collections import defaultdict
-    page_texts: Dict[int, List[str]] = defaultdict(list)
-    for txt, pg in chunks:
-        page_texts[int(pg)].append(str(txt))
-    page_blob: Dict[int, str] = {pg: "\n\n".join(parts) for pg, parts in page_texts.items()}
+    # Build study template from the extracted chunks
+    template = build_template_from_chunks(chunks, title=path.stem if hasattr(path, "stem") else "Document")
+    sections: List[dict] = template.get("sections", [])
 
-    # Build section text (for optional auto caps)
-    section_text: Dict[str, list[str]] = defaultdict(list)
-    if per_page_section_quotas:
-        for pg, lst in per_page_section_quotas.items():
-            if pg in page_blob:
-                for sec, _ in lst:
-                    section_text[sec].append(page_blob[pg])
-    elif page_to_section:
-        for pg, sec in page_to_section.items():
-            if sec and pg in page_blob:
-                section_text[sec].append(page_blob[pg])
+    # Determine per-section targets
+    targets: Dict[str, int] = {}
 
-    if section_caps is None and autoguess_section_caps and section_text:
-        section_caps = {sec: _estimate_facts("\n".join(txts)) for sec, txts in section_text.items()}
+    if sections_plan:
+        # Use UI plan but cap at max_cards_per_section
+        for a in sections_plan:
+            title = a.get("title") or ""
+            req = max(0, int(a.get("cards") or 0))
+            targets[_norm(title)] = min(req, max_cards_per_section)
+    elif total_cards is not None and sections:
+        quotas = _distribute_quota(int(total_cards), len(sections))
+        for sec, q in zip(sections, quotas):
+            targets[_norm(sec.get("title", ""))] = min(int(q), max_cards_per_section)
+    else:
+        # No plan, no global total → use per-section cap
+        for sec in sections:
+            targets[_norm(sec.get("title",""))] = max_cards_per_section
 
+    # Prepare generation state
     cards: list[dict] = []
     seen_keys: set[str] = set()
-    used_per_section: Dict[str, int] = defaultdict(int)
+    gen_seq = 0  # stable tie-breaker in sort
 
-    def _section_allowed(sec: Optional[str]) -> bool:
-        if not sec or not section_caps:
-            return True
-        cap = section_caps.get(sec)
-        return (cap is None) or (used_per_section[sec] < cap)
-
-    def _keep_card(c: dict) -> bool:
-        k = build_card_key(c.get("front", ""), c.get("back", ""))
+    def _keep(c: dict) -> bool:
+        k = build_card_key(c.get("front",""), c.get("back",""))
         if not k or k in seen_keys:
             return False
-        sec = c.get("section")
-        if not _section_allowed(sec):
-            return False
         seen_keys.add(k)
-        if sec:
-            used_per_section[sec] += 1
         c["card_key"] = k
         return True
 
-    # ── 1) NEW: per-page, per-section quotas (preserve page order and UI section order)
-    if per_page_section_quotas:
-        for page_no in sorted(per_page_section_quotas.keys()):
-            chunk_txt = page_blob.get(int(page_no))
-            if not chunk_txt:
-                continue
-            for section, need in per_page_section_quotas[page_no]:
-                need = min(int(need), max_cards_per_chunk)
-                while need > 0:
-                    # obey section caps if present
-                    if section and section_caps and section in section_caps:
-                        remaining = max(0, section_caps[section] - used_per_section[section])
-                        if remaining <= 0:
+    # Iterate sections in document order
+    for sec in sections:
+        sec_title = sec.get("title") or ""
+        sec_key = _norm(sec_title)
+        target = int(targets.get(sec_key, 0))
+        if target <= 0:
+            continue
+
+        items: List[dict] = sec.get("items") or []
+        if not items:
+            continue
+
+        kept_for_section = 0
+        idx_item = 0
+        passes_without_new = 0
+
+        # Cycle items until we reach target or make a full unproductive pass
+        while kept_for_section < target and passes_without_new < 2:
+            started = kept_for_section
+            # One pass over all items in-order
+            for i in range(len(items)):
+                if kept_for_section >= target:
+                    break
+                item = items[(idx_item + i) % len(items)]
+                text = _text_for_item(item, sec_title)
+                page_no = int(item.get("page") or sec.get("page_start") or 1)
+
+                # Ask model for 1 card per item (encourages variety + dedupe)
+                out = _cards_from_chunk(
+                    text,
+                    page_no=page_no,
+                    section=sec_title,
+                    max_cards=1
+                )
+                for c in out:
+                    # Attach metadata for order
+                    c["section"] = sec_title
+                    c["page"] = page_no if isinstance(c.get("page"), int) else page_no
+                    c["ordinal"] = int(item.get("ordinal") or 10**9)  # doc-order anchor
+                    c["_gen_seq"] = gen_seq
+                    gen_seq += 1
+                    if _keep(c):
+                        cards.append(c)
+                        kept_for_section += 1
+                        if kept_for_section >= target:
                             break
-                        batch = min(3, need, remaining)
-                    else:
-                        batch = min(3, need)
 
-                    got = _cards_from_chunk(chunk_txt, page_no=int(page_no), section=section, max_cards=batch)
-                    added = 0
-                    for c in got:
-                        c.setdefault("page", int(page_no))
-                        c.setdefault("section", section)
-                        if _keep_card(c):
-                            cards.append(c)
-                            added += 1
+            if kept_for_section == started:
+                passes_without_new += 1
+            else:
+                passes_without_new = 0
+            idx_item = (idx_item + 1) % len(items)
 
-                    if added == 0:
-                        break
-                    need -= added
+        # move to next section when done (we do not warn; we simply keep what we have)
 
-                if total_cards and len(cards) >= total_cards:
-                    break
-        return cards[: (total_cards or len(cards))]
+    # Optional global trim if total_cards is set
+    if total_cards is not None and len(cards) > int(total_cards):
+        cards = cards[: int(total_cards)]
 
-    # ── 2) Legacy: per-page quotas (single section per page)
-    def _section_for_page(pg: int) -> Optional[str]:
-        return page_to_section.get(int(pg)) if page_to_section else None
+    # Stable document order
+    cards.sort(key=lambda c: (int(c.get("ordinal") or 10**8), int(c.get("page") or 10**6), int(c.get("_gen_seq") or 0)))
 
-    if per_page_quotas:
-        for chunk_txt, page_no in chunks:
-            q = int(per_page_quotas.get(int(page_no), 0))
-            if q <= 0:
-                continue
-            q = min(q, max_cards_per_chunk)
-            sec = _section_for_page(page_no)
-            while q > 0:
-                if sec and section_caps and sec in section_caps:
-                    remaining = max(0, section_caps[sec] - used_per_section[sec])
-                    if remaining <= 0:
-                        break
-                    batch = min(3, q, remaining)
-                else:
-                    batch = min(3, q)
-                got = _cards_from_chunk(str(chunk_txt), page_no=int(page_no), section=sec, max_cards=batch)
-                added = 0
-                for c in got:
-                    if _keep_card(c):
-                        cards.append(c); added += 1
-                if added == 0:
-                    break
-                q -= added
-            if total_cards and len(cards) >= total_cards:
-                break
-        return cards[: (total_cards or len(cards))]
+    # Clean internal fields
+    for c in cards:
+        c.pop("_gen_seq", None)
 
-    # ── 3) Global cap distribution across chunks
-    if total_cards is not None:
-        quotas = _distribute_quota(int(total_cards), len(chunks))
-        for (chunk_txt, page_no), q in zip(chunks, quotas):
-            if q <= 0:
-                continue
-            q = min(q, max_cards_per_chunk)
-            sec = _section_for_page(page_no)
-            while q > 0:
-                batch = min(3, q)
-                got = _cards_from_chunk(str(chunk_txt), page_no=int(page_no), section=sec, max_cards=batch)
-                added = 0
-                for c in got:
-                    if _keep_card(c):
-                        cards.append(c); added += 1
-                if added == 0:
-                    break
-                q -= added
-            if len(cards) >= total_cards:
-                break
-        return cards[:total_cards]
-
-    # ── 4) Legacy per chunk (no global cap)
-    for chunk_txt, page_no in chunks:
-        sec = _section_for_page(page_no)
-        got = _cards_from_chunk(str(chunk_txt), page_no=int(page_no), section=sec, max_cards=max_cards_per_chunk)
-        for c in got:
-            if _keep_card(c):
-                cards.append(c)
     return cards
 
 
@@ -257,14 +251,14 @@ def write_json_for_document(
     *,
     max_tokens: int = 500,
     total_cards: int | None = None,
-    max_cards_per_chunk: int = 30,
+    max_cards_per_section: int = 8,
     sample_chunks: int | None = None,
 ) -> pathlib.Path:
     cards = cards_from_document(
         path,
         max_tokens=max_tokens,
         total_cards=total_cards,
-        max_cards_per_chunk=max_cards_per_chunk,
+        max_cards_per_section=max_cards_per_section,
         sample_chunks=sample_chunks,
         cache_chunks=False,
     )

@@ -1,11 +1,15 @@
 # flashcards/views.py
 from __future__ import annotations
 
-import logging, pathlib, random, tempfile
-from typing import Any, Dict, List
+import json
+import logging
+import pathlib
+import tempfile
+from typing import Any, Dict, List, Optional
 
 from django.core.files.uploadedfile import UploadedFile
-from django.db.models import F
+from django.db import models
+from django.db.models import F, Q
 from django.http import JsonResponse
 from rest_framework import status
 from rest_framework.decorators import api_view, parser_classes, permission_classes
@@ -16,14 +20,11 @@ from rest_framework.response import Response
 from .models import Card, Deck
 from .serializers import CardSerializer
 from .ai.analysis import analyze_document
-
-import json
-
-# IMPORTANT: use the global-target pipeline function
-# If your package layout differs, adjust this import:
 from .ai.pipeline.core import cards_from_document
+from .ai.flashcard_gen import build_card_key
 
 log = logging.getLogger(__name__)
+
 
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/analyze/  – quick document stats for the UI
@@ -36,13 +37,15 @@ def analyze(request):
     if not up:
         return Response({"detail": "file field required"}, status=400)
 
-    with tempfile.NamedTemporaryFile(delete=False,
-                                     suffix=pathlib.Path(up.name).suffix) as tmp:
-        for ch in up.chunks():
-            tmp.write(ch)
-    tmp_path = pathlib.Path(tmp.name)
-
+    tmp_path: Optional[pathlib.Path] = None
     try:
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=pathlib.Path(up.name).suffix
+        ) as tmp:
+            for ch in up.chunks():
+                tmp.write(ch)
+        tmp_path = pathlib.Path(tmp.name)
+
         stats = analyze_document(tmp_path)
         return Response(stats, status=200)
     except Exception as e:
@@ -50,174 +53,279 @@ def analyze(request):
         return Response({"detail": f"analyze failed: {e}"}, status=500)
     finally:
         try:
-            tmp_path.unlink(missing_ok=True)
+            if tmp_path:
+                tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
 
-# ────────────────────────────────────────────────────────────────────────────
-#  /api/flashcards/generate/  – upload a file → create deck
-# ────────────────────────────────────────────────────────────────────────────
-def _spread_even(total: int, pages: List[int]) -> Dict[int, int]:
-    total = max(0, int(total))
-    if not pages:
-        return {}
-    base, extra = divmod(total, len(pages))
-    q = {}
-    for i, p in enumerate(pages):
-        q[p] = q.get(p, 0) + base + (1 if i < extra else 0)
-    return q
 
+# ────────────────────────────────────────────────────────────────────────────
+# helpers
+# ────────────────────────────────────────────────────────────────────────────
+def _parse_allocations(raw: str | None) -> list[dict]:
+    """
+    Expect JSON like:
+      [
+        {"title":"A","page_start":1,"page_end":2,"cards":5},
+        ...
+      ]
+    """
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) or []
+        out = []
+        for a in data:
+            out.append(
+                {
+                    "title": (a.get("title") or "").strip(),
+                    "page_start": int(a.get("page_start") or 1),
+                    "page_end": int(a.get("page_end") or a.get("page_start") or 1),
+                    "cards": int(a.get("cards") or 0),
+                }
+            )
+        return out
+    except Exception:
+        return []
+
+
+def _stable_doc_ordering(qs):
+    """
+    Prefer Page ASC (NULLs last) then ID ASC as a stable tie-breaker.
+    """
+    # Push NULL pages to the end
+    nulls_last = models.Case(
+        models.When(page__isnull=True, then=models.Value(1)),
+        default=models.Value(0),
+        output_field=models.IntegerField(),
+    )
+    return qs.order_by(nulls_last, "page", "id")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  /api/flashcards/generate/  – upload a file → create a deck
+# ────────────────────────────────────────────────────────────────────────────
 @api_view(["POST"])
 @permission_classes([AllowAny])
 @parser_classes([MultiPartParser, FormParser])
 def generate_deck(request):
-    log.info("FILES: %s", request.FILES)
+    MAX_PER_SECTION = 8         # align with core.py default
+    MAX_TOTAL       = 30
+
     up: UploadedFile | None = request.FILES.get("file")
     if up is None:
         return Response({"detail": "file field required"}, status=400)
 
     deck_name = request.POST.get("deck_name", up.name)
 
+    # Desired total (fallback when no explicit per-section counts)
     try:
         cards_wanted = int(request.POST.get("cards_wanted", 12))
     except ValueError:
         cards_wanted = 12
-    # You can raise this if you want bigger decks
-    cards_wanted = max(3, min(cards_wanted, 60))
+    cards_wanted = max(3, min(cards_wanted, MAX_TOTAL))
 
-    # Parse optional per-section allocations from UI
-    import json
-    allocations = []
-    if request.POST.get("allocations"):
-        try:
-            allocations = json.loads(request.POST["allocations"]) or []
-        except Exception:
-            allocations = []
+    allocations = _parse_allocations(request.POST.get("allocations"))
 
-    # Build per-page *per-section* quotas preserving UI order
-    # Dict[int, List[Tuple[str,int]]], e.g. {1: [("Limits",2), ("Derivative",2), ...]}
-    def _spread_even(total: int, pages: List[int]) -> Dict[int, int]:
-        total = max(0, int(total))
-        if not pages:
-            return {}
-        base, extra = divmod(total, len(pages))
-        q = {}
-        for i, p in enumerate(pages):
-            q[p] = q.get(p, 0) + base + (1 if i < extra else 0)
-        return q
-
-    per_page_section_quotas: Dict[int, List[tuple[str, int]]] = {}
-    for a in allocations:
-        try:
+    # clamp per-section requests and compute planned totals
+    planned_by_title: dict[str, int] = {}
+    if allocations:
+        for a in allocations:
             title = (a.get("title") or "").strip()
-            c     = int(a.get("cards", 0))
-            p1    = int(a.get("page_start", 0))
-            p2    = int(a.get("page_end", 0))
-            if title and c > 0 and p1 >= 1 and p2 >= p1:
-                pages = list(range(p1, p2 + 1))
-                spread = _spread_even(c, pages)  # per-page split for this section
-                for pg in pages:
-                    cnt = int(spread.get(pg, 0))
-                    if cnt <= 0:
-                        continue
-                    per_page_section_quotas.setdefault(pg, []).append((title, cnt))
-        except Exception:
-            continue
+            if not title:
+                continue
+            n = int(a.get("cards") or 0)
+            planned_by_title[title] = max(0, min(n, MAX_PER_SECTION))
 
-    # If user gave a plan, total_cards comes from it; otherwise use cards_wanted
-    plan_total = sum(cnt for lst in per_page_section_quotas.values() for _, cnt in lst) if per_page_section_quotas else None
-    total_cards = max(3, min((plan_total or cards_wanted), 60))
+    total_cards = sum(planned_by_title.values()) if planned_by_title else cards_wanted
+    total_cards = max(3, min(total_cards, MAX_TOTAL))
 
-    tmp_path = None
+    tmp_path: Optional[pathlib.Path] = None
     try:
-        # Save upload to a temp file
-        with tempfile.NamedTemporaryFile(delete=False,
-                                         suffix=pathlib.Path(up.name).suffix) as tmp:
-            for chunk in up.chunks():
-                tmp.write(chunk)
+        # save upload to tmp
+        with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(up.name).suffix) as tmp:
+            for ch in up.chunks():
+                tmp.write(ch)
         tmp_path = pathlib.Path(tmp.name)
-        log.info("Temp saved → %s (%s bytes)", tmp_path, tmp_path.stat().st_size)
 
-        # Build cards (section-aware quotas). We disable autoguess caps when the user
-        # gave explicit per-section quotas for reliability.
-        from .ai.pipeline.core import cards_from_document
+        # sections_plan for pipeline (respect per-section caps we just clamped)
+        sections_plan = None
+        if allocations:
+            sections_plan = []
+            for a in allocations:
+                title = (a.get("title") or "").strip()
+                if not title:
+                    continue
+                sections_plan.append({
+                    "title": title,
+                    "page_start": int(a.get("page_start") or 1),
+                    "page_end": int(a.get("page_end") or 1),
+                    "cards": planned_by_title.get(title, 0),
+                })
+
+        # build cards from the PDF — UPDATED call (matches new core.py)
         cards = cards_from_document(
             tmp_path,
-            total_cards=total_cards if not per_page_section_quotas else None,
-            max_cards_per_chunk=30,
+            total_cards=total_cards,
             max_tokens=500,
-            per_page_section_quotas=per_page_section_quotas or None,
-            autoguess_section_caps=False if per_page_section_quotas else True,
+            sections_plan=sections_plan,          # heading→next heading slices (templater)
+            max_cards_per_section=MAX_PER_SECTION # hard cap per section
         )
-
         if not cards:
-            raise RuntimeError("OpenAI returned zero cards (check API key / quota / model)")
+            raise RuntimeError("Model returned zero cards.")
 
-        # Persist
+        # persist deck + cards
         user_obj = request.user if request.user.is_authenticated else None
         deck = Deck.objects.create(user=user_obj, name=deck_name)
 
-        from .ai.flashcard_gen import build_card_key
-
-        objs, seen = [], set()
-        for idx, c in enumerate(cards, start=1):
-            k = c.get("card_key") or build_card_key(c.get("front",""), c.get("back",""))
-            if k in seen:
+        objs: list[Card] = []
+        seen: set[str] = set()
+        for c in cards:
+            front = (c.get("front") or "").strip()
+            back  = (c.get("back") or "").strip()
+            if not front or not back:
+                continue
+            k = c.get("card_key") or build_card_key(front, back)
+            if not k or k in seen:
                 continue
             seen.add(k)
-            objs.append(Card(
-                deck=deck,
-                front=c["front"],
-                back=c["back"],
-                excerpt=c.get("excerpt", "")[:500],
-                page=c.get("page"),
-                section=c.get("section") or None,
-                context=c.get("context") or "",
-                card_key=k,
-                ordinal=idx,
-            ))
+            objs.append(
+                Card(
+                    deck=deck,
+                    front=front,
+                    back=back,
+                    excerpt=(c.get("excerpt") or "")[:500],
+                    page=int(c.get("page")) if isinstance(c.get("page"), int) else None,
+                    section=(c.get("section") or "").strip() or None,
+                    context=(c.get("context") or "").strip()[:20],
+                    card_key=k,
+                )
+            )
+        Card.objects.bulk_create(objs, ignore_conflicts=True)
 
-        # Best-effort dedupe at DB layer
-        from django.db.utils import IntegrityError
-        try:
-            Card.objects.bulk_create(objs, ignore_conflicts=True)
-        except IntegrityError:
-            pass
+        # Optional: keep the warnings UI you already wired up
+        warnings: list[str] = []
+        per_section_actual: dict[str, int] = dict(
+            Card.objects.filter(deck=deck)
+            .values_list("section")
+            .annotate(n=models.Count("id"))
+            .values_list("section", "n")
+        )
+        for title, planned_n in planned_by_title.items():
+            got = int(per_section_actual.get(title, 0))
+            if got < planned_n:
+                warnings.append(
+                    f'Section "{title}": requested {planned_n}, generated {got}. '
+                    "That section didn’t have enough distinct facts to make more."
+                )
 
-        return Response({"deck_id": deck.id, "cards_created": len(objs)}, status=201)
+        created = Card.objects.filter(deck=deck).count()
+        return Response(
+            {
+                "deck_id": deck.id,
+                "cards_created": created,
+                "requested": total_cards,
+                "warnings": warnings,
+                "per_section": [
+                    {
+                        "title": t,
+                        "planned": planned_by_title.get(t, 0),
+                        "created": int(per_section_actual.get(t, 0)),
+                    }
+                    for t in (planned_by_title.keys() or per_section_actual.keys())
+                ],
+            },
+            status=201,
+        )
 
     except Exception as exc:
         log.exception("Deck build failed")
         return Response({"detail": f"Deck build failed: {exc!s}"}, status=500)
     finally:
-        if tmp_path:
-            try:
+        try:
+            if tmp_path:
                 tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    
+
 # ────────────────────────────────────────────────────────────────────────────
-#  /api/flashcards/hand/  – return n random cards from a deck
+#  /api/flashcards/hand/  – fetch cards to study
+#     query:
+#       deck_id=…      (required)
+#       n=all|<int>    (default 12)
+#       order=doc|random (default random; doc = page asc, id asc)
+#       start_ordinal=<int> (optional, rotates list for doc order)
 # ────────────────────────────────────────────────────────────────────────────
 @api_view(["GET"])
 @permission_classes([IsAuthenticatedOrReadOnly])
 def hand(request) -> Response:
-    n_param = (request.GET.get("n") or "12").lower()
     deck_id = request.GET.get("deck_id")
-    order   = (request.GET.get("order") or "").lower()
+    if not deck_id:
+        return Response({"detail": "deck_id required"}, status=400)
 
-    qs = Card.objects.filter(deck_id=deck_id) if deck_id else Card.objects.all()
+    n_raw = request.GET.get("n", "12")
+    order = request.GET.get("order", "random")
+    start_ordinal = request.GET.get("start_ordinal")
+
+    qs = Card.objects.filter(deck_id=deck_id)
     if not qs.exists():
         return Response([], status=200)
 
     if order == "doc":
-        qs = qs.order_by("ordinal", "page", "section", "id")
+        qs = _stable_doc_ordering(qs)
     else:
         qs = qs.order_by("?")
 
-    cards = list(qs) if n_param in ("all", "0") else list(qs[:int(n_param or 12)])
-    return Response(CardSerializer(cards, many=True).data)
+    # n
+    if n_raw == "all":
+        cards_qs = qs
+    else:
+        try:
+            n = max(1, min(int(n_raw), 200))
+        except Exception:
+            n = 12
+        cards_qs = qs[:n]
+
+    cards_list = list(cards_qs)
+    # rotate when order=doc & start_ordinal provided
+    if order == "doc" and start_ordinal:
+        try:
+            start = max(1, int(start_ordinal)) - 1
+            start = start % len(cards_list)
+            cards_list = cards_list[start:] + cards_list[:start]
+        except Exception:
+            pass
+
+    data = CardSerializer(cards_list, many=True).data
+    return Response(data)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+#  /api/flashcards/toc/  – Table of Contents for a deck (doc order + ordinal)
+# ────────────────────────────────────────────────────────────────────────────
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def toc(request) -> Response:
+    deck_id = request.GET.get("deck_id")
+    if not deck_id:
+        return Response({"detail": "deck_id required"}, status=400)
+
+    qs = _stable_doc_ordering(Card.objects.filter(deck_id=deck_id))
+    items = []
+    for i, c in enumerate(qs, start=1):
+        items.append(
+            {
+                "id": c.id,
+                "ordinal": i,
+                "front": c.front,
+                "section": c.section or "",
+                "page": c.page,
+                "context": c.context or "",
+            }
+        )
+    return Response(items, status=200)
+
 
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/feedback/  – increment right/wrong counters
@@ -226,13 +334,14 @@ def hand(request) -> Response:
 @permission_classes([IsAuthenticatedOrReadOnly])
 def feedback(request) -> Response:
     data: dict[str, Any] = request.data or {}
-    right_ids  = data.get("right", [])
-    wrong_ids  = data.get("wrong", [])
+    right_ids = data.get("right", [])
+    wrong_ids = data.get("wrong", [])
     if right_ids:
         Card.objects.filter(id__in=right_ids).update(right=F("right") + 1)
     if wrong_ids:
         Card.objects.filter(id__in=wrong_ids).update(wrong=F("wrong") + 1)
     return Response({"ok": True})
+
 
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/health  – simple health check
