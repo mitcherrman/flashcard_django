@@ -33,6 +33,7 @@ DEBUG = bool(int(os.getenv("DEBUG", 1)))
 # ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 ALLOWED_HOSTS = ["*"]   # dev‑only
 
+CORS_ALLOW_ALL_ORIGINS = True
 
 # Application definition
 
