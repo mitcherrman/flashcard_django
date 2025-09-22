@@ -22,3 +22,15 @@ class Card(models.Model):
 
     section = models.CharField(max_length=200, null=True, blank=True)
 
+    # Duplicate guard you already added
+    card_key = models.CharField(max_length=64, db_index=True, blank=True, default="")
+
+    # NEW: generation order (1, 2, 3, …) within a deck
+    ordinal = models.PositiveIntegerField(default=0, db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["deck", "card_key"], name="uniq_card_by_key_per_deck"),
+            # Optional: once you’ve backfilled ordinals for old rows, you can enforce this too
+            # models.UniqueConstraint(fields=["deck", "ordinal"], name="uniq_card_seq_per_deck"),
+        ]
