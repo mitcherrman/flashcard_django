@@ -266,12 +266,12 @@ def hand(request) -> Response:
 
     n_raw = request.GET.get("n", "12")
     order = request.GET.get("order", "random")
-    start_ordinal = request.GET.get("start_ordinal")
 
     qs = Card.objects.filter(deck_id=deck_id)
     if not qs.exists():
         return Response([], status=200)
 
+    # Preserve canonical document order; no rotation here
     if order == "doc":
         qs = _stable_doc_ordering(qs)
     else:
@@ -287,17 +287,7 @@ def hand(request) -> Response:
             n = 12
         cards_qs = qs[:n]
 
-    cards_list = list(cards_qs)
-    # rotate when order=doc & start_ordinal provided
-    if order == "doc" and start_ordinal:
-        try:
-            start = max(1, int(start_ordinal)) - 1
-            start = start % len(cards_list)
-            cards_list = cards_list[start:] + cards_list[:start]
-        except Exception:
-            pass
-
-    data = CardSerializer(cards_list, many=True).data
+    data = CardSerializer(list(cards_qs), many=True).data
     return Response(data)
 
 
