@@ -106,9 +106,9 @@ def cards_from_document(
     *,
     # global control
     total_cards: int | None = None,           # optional overall cap (still respects per-section caps)
-    max_cards_per_section: int = 8,           # NEW default hard cap per section
+    max_cards_per_section: int = 8,           # default hard cap per section
     # extraction / testing
-    max_tokens: int = 500,
+    max_tokens: int = 600,                    # align with your new chunk size
     sample_chunks: int | None = None,
     cache_chunks: bool = True,
     # UI plan (section → requested #cards). Titles must match user UI.
@@ -118,7 +118,7 @@ def cards_from_document(
     Turn a document into list[card-dict] using the Study Template.
 
     Behavior:
-      • Build a template (heading→next heading; items inside).
+      • Build a template (heading→next heading; items inside) using an LLM-driven templater.
       • For each section, try to generate as many *unique* cards as possible
         up to min(requested, max_cards_per_section). If no plan is provided:
           – if total_cards is set: distribute across sections and cap per section
@@ -142,15 +142,18 @@ def cards_from_document(
         except Exception as e:
             log.warning("Could not write chunk cache %s: %s", cache, e)
 
-    # Build study template from the extracted chunks
-    template = build_template_from_chunks(chunks, title=path.stem if hasattr(path, "stem") else "Document")
+    # Build LLM study template (the templater will decide single-call vs per-section)
+    template = build_template_from_chunks(
+        chunks,
+        title=path.stem if hasattr(path, "stem") else "Document",
+        path=path,  # ← pass path so templater can do TOC-aware chunking if needed
+    )
     sections: List[dict] = template.get("sections", [])
 
     # Determine per-section targets
     targets: Dict[str, int] = {}
 
     if sections_plan:
-        # Use UI plan but cap at max_cards_per_section
         for a in sections_plan:
             title = a.get("title") or ""
             req = max(0, int(a.get("cards") or 0))
@@ -160,7 +163,6 @@ def cards_from_document(
         for sec, q in zip(sections, quotas):
             targets[_norm(sec.get("title", ""))] = min(int(q), max_cards_per_section)
     else:
-        # No plan, no global total → use per-section cap
         for sec in sections:
             targets[_norm(sec.get("title",""))] = max_cards_per_section
 
@@ -196,7 +198,6 @@ def cards_from_document(
         # Cycle items until we reach target or make a full unproductive pass
         while kept_for_section < target and passes_without_new < 2:
             started = kept_for_section
-            # One pass over all items in-order
             for i in range(len(items)):
                 if kept_for_section >= target:
                     break
@@ -204,7 +205,6 @@ def cards_from_document(
                 text = _text_for_item(item, sec_title)
                 page_no = int(item.get("page") or sec.get("page_start") or 1)
 
-                # Ask model for 1 card per item (encourages variety + dedupe)
                 out = _cards_from_chunk(
                     text,
                     page_no=page_no,
@@ -212,10 +212,9 @@ def cards_from_document(
                     max_cards=1
                 )
                 for c in out:
-                    # Attach metadata for order
                     c["section"] = sec_title
                     c["page"] = page_no if isinstance(c.get("page"), int) else page_no
-                    c["ordinal"] = int(item.get("ordinal") or 10**9)  # doc-order anchor
+                    c["ordinal"] = int(item.get("ordinal") or 10**9)
                     c["_gen_seq"] = gen_seq
                     gen_seq += 1
                     if _keep(c):
@@ -230,16 +229,13 @@ def cards_from_document(
                 passes_without_new = 0
             idx_item = (idx_item + 1) % len(items)
 
-        # move to next section when done (we do not warn; we simply keep what we have)
-
-    # Optional global trim if total_cards is set
+    # Optional global trim
     if total_cards is not None and len(cards) > int(total_cards):
         cards = cards[: int(total_cards)]
 
     # Stable document order
     cards.sort(key=lambda c: (int(c.get("ordinal") or 10**8), int(c.get("page") or 10**6), int(c.get("_gen_seq") or 0)))
 
-    # Clean internal fields
     for c in cards:
         c.pop("_gen_seq", None)
 
@@ -249,7 +245,7 @@ def cards_from_document(
 def write_json_for_document(
     path: pathlib.Path,
     *,
-    max_tokens: int = 500,
+    max_tokens: int = 600,       # align default with new chunk size
     total_cards: int | None = None,
     max_cards_per_section: int = 8,
     sample_chunks: int | None = None,

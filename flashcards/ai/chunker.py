@@ -1,5 +1,5 @@
 """
-chunker.py – split (text,page_no) tuples into ≈ max_tokens chunks.
+chunker.py – split (text,page_no) tuples into ≈ max_tokens chunks.
 Returns List[tuple[str,int]]   →  (chunk_text, starting_page)
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ enc = tiktoken.encoding_for_model("gpt-4o-mini")   # falls back gracefully
 
 def make_chunks(
     pages: List[Tuple[str, int]],       # [(page_text, page_no), …]
-    max_tokens: int = 500,
+    max_tokens: int = 600,              # bumped to your requested size
 ) -> List[Tuple[str, int]]:
     chunks: list[tuple[str, int]] = []
 

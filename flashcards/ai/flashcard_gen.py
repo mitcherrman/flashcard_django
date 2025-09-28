@@ -25,7 +25,7 @@ Card types to mix: definition/term, concept→example, example→concept, steps 
 Rules:
 • The *front* must be a clear, self-contained question (≤ 20 words).
 • The *back* is the exact answer (≤ 25 words), normalized (units/terms) and unambiguous.
-• Add 2 plausible *distractors* (same type/units/scale; no “all/none of the above”).
+• Add 3 *plausible but wrong* distractors that are close in type/scale to the correct answer and reflect realistic confusions (e.g., near-miss numeric magnitudes, incorrect units, sibling concepts, sign/order/term confusions). No giveaway phrasing, no "all/none of the above".
 • Include a short *excerpt* (≤ 80 words) copied or tightly paraphrased from the chunk that supports the answer. If you must paraphrase, keep it faithful to the source.
 • Use a general *context* tag from this set:
   "definition" | "concept" | "process" | "example" | "comparison" | "timeline" | "formula" | "other"
@@ -40,7 +40,7 @@ Return **only** a JSON object exactly in this schema and nothing else:
       "front": "string",
       "back": "string",
       "excerpt": "string",
-      "distractors": ["str","str"],
+      "distractors": ["str","str","str"],
       "context": "definition | concept | process | example | comparison | timeline | formula | other",
       "page": 12,
       "section": "string"
@@ -50,6 +50,29 @@ Return **only** a JSON object exactly in this schema and nothing else:
 
 Max items in "cards": MAX_CARDS
 """.strip()
+
+def _normalize_distractors(correct: str, raw) -> list[str]:
+    """Keep up to 3 unique non-empty strings, not equal (case/trim) to correct."""
+    def norm(s: str) -> str:
+        return " ".join((s or "").strip().split())
+    correct_n = norm(str(correct or ""))
+    out: list[str] = []
+    seen = set()
+    if isinstance(raw, list):
+        for x in raw:
+            sx = norm(str(x or ""))
+            if not sx:
+                continue
+            if sx.lower() == correct_n.lower():
+                continue
+            key = sx.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(sx)
+            if len(out) >= 3:
+                break
+    return out[:3]
 
 def _ask_openai(chunk_text: str, page_no: int, section: Optional[str], max_cards: int) -> List[dict]:
     """One call to OpenAI that *should* return up to max_cards cards."""
@@ -132,10 +155,14 @@ def _cards_from_chunk(
 
         want = max(0, max_cards - len(have))
 
-    # Guarantee metadata
+    # Guarantee metadata and normalize distractors
     for c in have:
         c.setdefault("page", page_no)
         if section:
             c.setdefault("section", section)
+
+        # Normalize distractors to 0–3 strings distinct from the correct answer
+        back = c.get("back", "")
+        c["distractors"] = _normalize_distractors(back, c.get("distractors", []))
 
     return have[:max_cards]

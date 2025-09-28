@@ -6,4 +6,4 @@ class CardSerializer(serializers.ModelSerializer):
         model = Card
         fields = ["id", "deck", "front", "back",
                   "excerpt", "context", "page", "section",
-                  "right", "wrong", "ordinal"]
+                  "right", "wrong", "ordinal", "distractors"]

@@ -199,6 +199,7 @@ def generate_deck(request):
                     section=(c.get("section") or "").strip() or None,
                     context=(c.get("context") or "").strip()[:20],
                     card_key=k,
+                    distractors=c.get("distractors") or [],
                 )
             )
         Card.objects.bulk_create(objs, ignore_conflicts=True)
