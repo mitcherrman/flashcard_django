@@ -1,15 +1,7 @@
-"""
-flashcards.ai.pipeline.core
-———————————
-Pure-library helpers – **NO Django, NO prints**.
-
-• cards_from_document(path, …) → list[dict]   (used by views.generate_deck)
-• write_json_for_document(path, …) → Path     (optional utility)
-"""
 from __future__ import annotations
 import pathlib, random, pickle, json, logging, re
 from typing import List, Tuple, Dict, Optional, Any
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..driver         import run_extraction
 from ..flashcard_gen  import _cards_from_chunk, build_card_key
@@ -17,13 +9,12 @@ from .templater       import build_template_from_chunks
 
 log = logging.getLogger(__name__)
 
-# ───────────────────────── helpers ─────────────────────────
+MAX_CHARS_SINGLE: int = 24_000
+DEFAULT_MAX_TOKENS: int = 600
+DEFAULT_CONCURRENCY: int = 4
 
 def _normalize_chunks(raw_chunks) -> List[Tuple[str, int]]:
-    """
-    Convert driver output into [(text, page)] in natural order.
-    Accepts tuples/lists/dicts/strings from the driver.
-    """
+    # (unchanged)
     def _pick_page_from(item_parts: List[Any], fallback: int) -> int:
         page: Optional[int] = None
         for elem in item_parts:
@@ -54,79 +45,72 @@ def _normalize_chunks(raw_chunks) -> List[Tuple[str, int]]:
         norm.append((str(item), idx))
     return norm
 
-
 def _distribute_quota(total: int, parts: int) -> list[int]:
     if parts <= 0:
         return []
     base, extra = divmod(max(0, int(total)), parts)
     return [base + (1 if i < extra else 0) for i in range(parts)]
 
-
 def _norm(s: str) -> str:
-    """Loose normalization for fuzzy title matching."""
     s = (s or "").lower()
     s = re.sub(r"[\s\u200b]+", " ", s)
     s = re.sub(r"[^\w\s&:+/().,'’\-^*=\[\]{}|]", "", s)
     return s.strip()
 
+def _section_text_from_pages(sec: dict, chunks: List[Tuple[str, int]], max_chars: int = MAX_CHARS_SINGLE) -> str:
+    ps = sec.get("page_start")
+    pe = sec.get("page_end")
+    if not (isinstance(ps, int) and isinstance(pe, int) and ps <= pe):
+        return ""  # << critical change: no bogus page=1 fallback; force item-based text
+    parts: List[str] = []
+    for txt, pg in chunks:
+        ip = int(pg)
+        if ps <= ip <= pe:
+            t = (txt or "").strip()
+            if t:
+                parts.append(t)
+    joined = "\n\n".join(parts).strip()
+    return joined[:max_chars] if len(joined) > max_chars else joined
 
-# ───────────────── item → short text payload ─────────────────
+def _fallback_text_from_items(sec: dict, max_chars: int = MAX_CHARS_SINGLE) -> str:
+    out: List[str] = []
+    for it in (sec.get("items") or []):
+        q = (it.get("term") or it.get("q") or "").strip()
+        a = (it.get("definition") or it.get("a") or "").strip()
+        line = (it.get("source_excerpt") or "").strip()
+        if line:
+            out.append(line)
+        elif q and a:
+            out.append(f"{q}: {a}")
+    blob = "\n".join(out).strip()
+    return blob[:max_chars] if len(blob) > max_chars else blob
 
-def _text_for_item(item: dict, section_title: str) -> str:
-    t = (item.get("type") or "").lower()
-    ex = item.get("source_excerpt") or ""
-    if t == "definition":
-        term = item.get("term") or ""
-        definition = item.get("definition") or ""
-        if term and definition:
-            return f"{term}: {definition}"
-        return ex or definition or term
-    if t == "formula":
-        name = item.get("name") or "Formula"
-        expr = item.get("expression") or ""
-        return f"{name}: {expr}" if expr else (ex or name)
-    if t == "example":
-        prompt = item.get("prompt") or ""
-        sol = item.get("solution") or ""
-        return f"Example: {prompt}" + (f" = {sol}" if sol else "")
-    if t == "concept":
-        term = item.get("term") or ""
-        definition = item.get("definition") or ""
-        if term and definition:
-            return f"{term}: {definition}"
-        return definition or term or ex
-    # fallback
-    return ex or f"{section_title} – key point"
-
-
-# ───────────────────── public API ──────────────────────────
+def _mix_text(page_text: str, seed_lines: str, limit: int = MAX_CHARS_SINGLE) -> str:
+    """Combine page slice + seed QA so each section input is distinctive."""
+    parts = []
+    if page_text:
+        parts.append(page_text)
+    if seed_lines:
+        parts.append("\n\nSEED QA LINES:\n" + seed_lines)
+    if not parts:
+        return ""
+    blob = ("\n".join(parts)).strip()
+    return blob[:limit] if len(blob) > limit else blob
 
 def cards_from_document(
     path: pathlib.Path,
     *,
-    # global control
-    total_cards: int | None = None,           # optional overall cap (still respects per-section caps)
-    max_cards_per_section: int = 8,           # default hard cap per section
-    # extraction / testing
-    max_tokens: int = 600,                    # align with your new chunk size
+    total_cards: int | None = None,
+    max_cards_per_section: int = 8,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     sample_chunks: int | None = None,
     cache_chunks: bool = True,
-    # UI plan (section → requested #cards). Titles must match user UI.
-    sections_plan: Optional[List[Dict[str, Any]]] = None,  # [{title,page_start,page_end,cards}]
+    concurrency: int = DEFAULT_CONCURRENCY,
+    sections_plan: Optional[List[Dict[str, Any]]] = None,
 ) -> List[dict]:
-    """
-    Turn a document into list[card-dict] using the Study Template.
 
-    Behavior:
-      • Build a template (heading→next heading; items inside) using an LLM-driven templater.
-      • For each section, try to generate as many *unique* cards as possible
-        up to min(requested, max_cards_per_section). If no plan is provided:
-          – if total_cards is set: distribute across sections and cap per section
-          – else: aim for max_cards_per_section for every section
-      • Output is in *document order* (by item ordinal; then page; then sequence).
-    """
     raw = run_extraction(path, max_tokens=max_tokens)
-    chunks = _normalize_chunks(raw)  # -> [(text, page)]
+    chunks = _normalize_chunks(raw)
     log.info("core: %s chunk(s) ready", len(chunks))
 
     if sample_chunks:
@@ -142,17 +126,17 @@ def cards_from_document(
         except Exception as e:
             log.warning("Could not write chunk cache %s: %s", cache, e)
 
-    # Build LLM study template (the templater will decide single-call vs per-section)
     template = build_template_from_chunks(
         chunks,
         title=path.stem if hasattr(path, "stem") else "Document",
-        path=path,  # ← pass path so templater can do TOC-aware chunking if needed
+        path=path,
     )
-    sections: List[dict] = template.get("sections", [])
+    sections: List[dict] = template.get("sections", []) or []
+    if not sections:
+        return []
 
-    # Determine per-section targets
+    # targets
     targets: Dict[str, int] = {}
-
     if sections_plan:
         for a in sections_plan:
             title = a.get("title") or ""
@@ -166,99 +150,109 @@ def cards_from_document(
         for sec in sections:
             targets[_norm(sec.get("title",""))] = max_cards_per_section
 
-    # Prepare generation state
+    # worker
+    def _gen_for_section(sec_index: int, sec: dict, target: int) -> tuple[int, list[dict]]:
+        title = sec.get("title") or ""
+        page_start = int(sec.get("page_start") or 1)
+
+        page_text = _section_text_from_pages(sec, chunks, MAX_CHARS_SINGLE)
+        seed = _fallback_text_from_items(sec, MAX_CHARS_SINGLE)
+        text = _mix_text(page_text, seed, MAX_CHARS_SINGLE)
+        if not text:
+            text = title  # last resort
+
+        out = _cards_from_chunk(text, page_no=page_start, section=title, max_cards=target)
+
+        # top-up once if short
+        if isinstance(out, list) and len(out) < target and target > 0:
+            need = target - len(out)
+            more = _cards_from_chunk(text, page_no=page_start, section=title, max_cards=need)
+            if isinstance(more, list) and more:
+                out.extend(more[:need])
+
+        return (sec_index, out or [])
+
+    # submit jobs where target > 0
+    jobs = [(i, s, int(targets.get(_norm(s.get("title") or ""), 0))) for i, s in enumerate(sections)]
+    jobs = [(i, s, t) for (i, s, t) in jobs if t > 0]
+
+    results_by_index: dict[int, list[dict]] = {}
+    if jobs:
+        max_workers = max(1, min(concurrency, len(jobs)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(_gen_for_section, i, s, t) for (i, s, t) in jobs]
+            for fut in as_completed(futs):
+                try:
+                    idx, out_cards = fut.result()
+                    results_by_index[idx] = out_cards or []
+                except Exception as e:
+                    log.warning("core: section worker failed: %s", e)
+    else:
+        return []
+
+    # dedupe & order
     cards: list[dict] = []
     seen_keys: set[str] = set()
-    gen_seq = 0  # stable tie-breaker in sort
+    for sec_index in sorted(results_by_index.keys()):
+        out_cards = results_by_index[sec_index]
+        base_ord = sec_index * 10_000
+        kept = 0
+        for j, c in enumerate(out_cards):
+            front = (c.get("front") or "").strip()
+            back  = (c.get("back")  or "").strip()
+            if not front or not back:
+                continue
+            k = c.get("card_key") or build_card_key(front, back)
+            if not k or k in seen_keys:
+                continue
+            seen_keys.add(k)
+            c["card_key"] = k
+            sec = sections[sec_index]
+            c.setdefault("section", sec.get("title") or "")
+            try:
+                pg = int(c.get("page")) if isinstance(c.get("page"), int) else int(sec.get("page_start") or 1)
+            except Exception:
+                pg = int(sec.get("page_start") or 1)
+            c["page"] = pg
+            c["ordinal"] = base_ord + kept
+            cards.append(c)
+            kept += 1
 
-    def _keep(c: dict) -> bool:
-        k = build_card_key(c.get("front",""), c.get("back",""))
-        if not k or k in seen_keys:
-            return False
-        seen_keys.add(k)
-        c["card_key"] = k
-        return True
-
-    # Iterate sections in document order
-    for sec in sections:
-        sec_title = sec.get("title") or ""
-        sec_key = _norm(sec_title)
-        target = int(targets.get(sec_key, 0))
-        if target <= 0:
-            continue
-
-        items: List[dict] = sec.get("items") or []
-        if not items:
-            continue
-
-        kept_for_section = 0
-        idx_item = 0
-        passes_without_new = 0
-
-        # Cycle items until we reach target or make a full unproductive pass
-        while kept_for_section < target and passes_without_new < 2:
-            started = kept_for_section
-            for i in range(len(items)):
-                if kept_for_section >= target:
+    # global catch-up (one extra call) if we undershot
+    if total_cards is not None and len(cards) < int(total_cards):
+        need = int(total_cards) - len(cards)
+        # Build a compact mixed seed from all sections' QA lines (unique)
+        lines = []
+        seen_line = set()
+        for sec in sections:
+            blob = _fallback_text_from_items(sec, 2000)  # small slice per section
+            for ln in blob.splitlines():
+                ln = ln.strip()
+                if ln and ln.lower() not in seen_line:
+                    seen_line.add(ln.lower())
+                    lines.append(ln)
+        seed_mixed = "\n".join(lines[:800])  # cap lines
+        mix_text = _mix_text("", seed_mixed, MAX_CHARS_SINGLE)
+        if mix_text:
+            extra = _cards_from_chunk(mix_text, page_no=1, section="Mixed topics", max_cards=need)
+            for c in extra or []:
+                front = (c.get("front") or "").strip()
+                back  = (c.get("back")  or "").strip()
+                if not front or not back:
+                    continue
+                k = c.get("card_key") or build_card_key(front, back)
+                if not k or k in seen_keys:
+                    continue
+                seen_keys.add(k)
+                c["card_key"] = k
+                c.setdefault("section", "Mixed topics")
+                c.setdefault("page", 1)
+                c["ordinal"] = 9_000_000 + len(cards)  # after all sections
+                cards.append(c)
+                if len(cards) >= int(total_cards):
                     break
-                item = items[(idx_item + i) % len(items)]
-                text = _text_for_item(item, sec_title)
-                page_no = int(item.get("page") or sec.get("page_start") or 1)
 
-                out = _cards_from_chunk(
-                    text,
-                    page_no=page_no,
-                    section=sec_title,
-                    max_cards=1
-                )
-                for c in out:
-                    c["section"] = sec_title
-                    c["page"] = page_no if isinstance(c.get("page"), int) else page_no
-                    c["ordinal"] = int(item.get("ordinal") or 10**9)
-                    c["_gen_seq"] = gen_seq
-                    gen_seq += 1
-                    if _keep(c):
-                        cards.append(c)
-                        kept_for_section += 1
-                        if kept_for_section >= target:
-                            break
-
-            if kept_for_section == started:
-                passes_without_new += 1
-            else:
-                passes_without_new = 0
-            idx_item = (idx_item + 1) % len(items)
-
-    # Optional global trim
     if total_cards is not None and len(cards) > int(total_cards):
         cards = cards[: int(total_cards)]
 
-    # Stable document order
-    cards.sort(key=lambda c: (int(c.get("ordinal") or 10**8), int(c.get("page") or 10**6), int(c.get("_gen_seq") or 0)))
-
-    for c in cards:
-        c.pop("_gen_seq", None)
-
     return cards
-
-
-def write_json_for_document(
-    path: pathlib.Path,
-    *,
-    max_tokens: int = 600,       # align default with new chunk size
-    total_cards: int | None = None,
-    max_cards_per_section: int = 8,
-    sample_chunks: int | None = None,
-) -> pathlib.Path:
-    cards = cards_from_document(
-        path,
-        max_tokens=max_tokens,
-        total_cards=total_cards,
-        max_cards_per_section=max_cards_per_section,
-        sample_chunks=sample_chunks,
-        cache_chunks=False,
-    )
-    out = path.with_suffix(".cards.json")
-    out.write_text(json.dumps(cards, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("Card JSON written → %s (%s cards)", out.name, len(cards))
-    return out

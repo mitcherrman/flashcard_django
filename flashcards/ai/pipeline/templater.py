@@ -194,105 +194,117 @@ def build_template_from_chunks(
     title: str = "Untitled",
     path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "version": "study-template/llm-v1",
-        "title": <title>,
-        "pages": <pages>,
-        "sections": [
-          {
-            "title": "...",
-            "page_start": int|null,
-            "page_end": int|null,
-            "items": [
-              {
-                "type": "concept",
-                "term": <question>,
-                "definition": <answer>,
-                "source_excerpt": "<Q: A>",
-                "page": int|null,
-                "ordinal": int
-              }, ...
-            ]
-          }, ...
-        ],
-        "toc": [{"title":"...", "page_start":..., "page_end":..., "ordinal_first": ...}, ...]
-      }
-    """
-    # 1) Concatenate what we already have (from core/driver) and quick size check
     doc_text, pages_count = _concat(chunks)
 
-    # 2) Short doc → single LLM call
+    # Try TOC-aware extraction first if we have a real file path.
+    extracted = []
+    if path:
+        try:
+            extracted = run_extraction(path, max_tokens=MAX_TOKENS_CHUNK)  # [(text, page_start, section_title|None)]
+        except Exception as e:
+            log.warning("run_extraction failed (TOC-aware): %s", e)
+            extracted = []
+
+    # If we got multiple logical chunks (TOC sections or page slices), prefer parallel section templating.
+    if extracted and (len(extracted) > 1 or any(t for _, __, t in extracted)):
+        # Parallelize per-chunk templating for speed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        merged: List[Section] = []
+        futs = []
+        with ThreadPoolExecutor(max_workers=min(6, len(extracted))) as ex:
+            for (chunk_text, page_start, sec_title) in extracted:
+                fut = ex.submit(
+                    _ask_llm_sections,
+                    chunk_text,
+                    title_hint=title,
+                    section_hint=sec_title if isinstance(sec_title, str) and sec_title.strip() else None,
+                )
+                futs.append((fut, page_start))
+            for fut, page_start in futs:
+                try:
+                    secs = fut.result() or []
+                    for s in secs:
+                        s.page_start = int(page_start) if page_start is not None else None
+                        s.page_end = None
+                    merged = _merge_sections(merged, secs)
+                except Exception as e:
+                    log.warning("templater chunk failed: %s", e)
+
+        return _template_from_sections(merged, pages=pages_count, title=title)
+
+    # Fallbacks:
+    # 1) Small doc with no useful TOC → single call
     if len(doc_text) <= MAX_CHARS_SINGLE:
         secs = _ask_llm_sections(doc_text, title_hint=title)
         return _template_from_sections(secs, pages=pages_count, title=title)
 
-    # 3) Long doc → prefer TOC-aware chunks via driver; one LLM call per section/page chunk.
-    #    NOTE: run_extraction() will itself fall back to per-page if no TOC.
-    try:
-        extracted = run_extraction(path, max_tokens=MAX_TOKENS_CHUNK) if path else []
-    except Exception as e:
-        log.warning("run_extraction failed; falling back to single-call best-effort: %s", e)
-        secs = _ask_llm_sections(doc_text, title_hint=title)
-        return _template_from_sections(secs, pages=pages_count, title=title)
-
-    if not extracted:
-        # Last resort: still try single call on the first 24k chars
-        secs = _ask_llm_sections(doc_text[:MAX_CHARS_SINGLE], title_hint=title)
-        return _template_from_sections(secs, pages=pages_count, title=title)
-
-    # extracted: list of (text, page_start, section_title|None)
-    merged: List[Section] = []
-    for (chunk_text, page_start, sec_title) in extracted:
-        secs = _ask_llm_sections(
-            chunk_text,
-            title_hint=title,
-            section_hint=sec_title if isinstance(sec_title, str) and sec_title.strip() else None,
-        )
-        # attach page metadata to sections
-        for s in secs:
-            s.page_start = int(page_start) if page_start is not None else None
-            s.page_end = None
-        merged = _merge_sections(merged, secs)
-
-    return _template_from_sections(merged, pages=pages_count, title=title)
+    # 2) Long doc but we couldn't extract → single-call best-effort on head
+    secs = _ask_llm_sections(doc_text[:MAX_CHARS_SINGLE], title_hint=title)
+    return _template_from_sections(secs, pages=pages_count, title=title)
 
 # --------------------------------------------------------------------
 # Convert LLM Sections → your template schema (items are QA pairs)
 # --------------------------------------------------------------------
+# ... (everything above unchanged)
+
 def _template_from_sections(sections: List[Section], *, pages: int, title: str) -> Dict[str, Any]:
+    def _even_ranges(n: int, total_pages: int) -> List[tuple[int,int]]:
+        """Divide [1..total_pages] into n contiguous 1-based ranges (balanced)."""
+        total_pages = max(1, int(total_pages or 1))
+        n = max(1, int(n or 1))
+        out = []
+        for i in range(n):
+            # floor division partitioning
+            start = (i * total_pages) // n + 1
+            end   = ((i + 1) * total_pages) // n
+            start = max(1, min(start, total_pages))
+            end   = max(start, min(end, total_pages))
+            out.append((start, end))
+        # guarantee coverage end-to-end
+        if out:
+            out[0] = (1, out[0][1])
+            out[-1] = (out[-1][0], total_pages)
+        return out
+
     ordinal = 1
     out_sections: List[Dict[str, Any]] = []
     toc: List[Dict[str, Any]] = []
 
-    for s in sections:
+    # Precompute default ranges if any section lacks page metadata
+    defaults = _even_ranges(len(sections), pages)
+
+    for idx, s in enumerate(sections):
+        # Fill missing page ranges with even partitions
+        ps = s.page_start if isinstance(s.page_start, int) else None
+        pe = s.page_end   if isinstance(s.page_end,   int) else None
+        if ps is None or pe is None:
+            ps, pe = defaults[idx]
+
         items: List[Dict[str, Any]] = []
         first_ord = ordinal
         for b in s.bullets:
-            # Represent Q/A as a "concept" item with term/definition,
-            # so your existing _text_for_item() yields "Q: A" nicely.
             items.append({
                 "type": "concept",
                 "term": b.q,
                 "definition": b.a,
                 "source_excerpt": f"{b.q}: {b.a}",
-                "page": s.page_start or None,
+                "page": ps,
                 "ordinal": ordinal,
             })
             ordinal += 1
 
         out_sections.append({
             "title": s.title or "Section",
-            "page_start": s.page_start or None,
-            "page_end": s.page_end or None,
+            "page_start": ps,
+            "page_end": pe,
             "items": items,
         })
 
         toc.append({
             "title": s.title or "Section",
-            "page_start": s.page_start or None,
-            "page_end": s.page_end or None,
+            "page_start": ps,
+            "page_end": pe,
             "ordinal_first": first_ord,
         })
 

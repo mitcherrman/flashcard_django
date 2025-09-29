@@ -169,7 +169,8 @@ def generate_deck(request):
             total_cards=total_cards,
             max_tokens=500,
             sections_plan=sections_plan,          # heading→next heading slices (templater)
-            max_cards_per_section=MAX_PER_SECTION # hard cap per section
+            max_cards_per_section=MAX_PER_SECTION, # hard cap per section
+            concurrency=8,
         )
         if not cards:
             raise RuntimeError("Model returned zero cards.")

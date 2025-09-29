@@ -4,6 +4,7 @@ from typing import List, Optional
 from openai import OpenAI
 
 log = logging.getLogger(__name__)
+CLIENT = OpenAI()  
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
 def build_card_key(front: str, back: str) -> str:
@@ -75,16 +76,14 @@ def _normalize_distractors(correct: str, raw) -> list[str]:
     return out[:3]
 
 def _ask_openai(chunk_text: str, page_no: int, section: Optional[str], max_cards: int) -> List[dict]:
-    """One call to OpenAI that *should* return up to max_cards cards."""
     prompt = SYSTEM_PROMPT.replace("MAX_CARDS", str(max_cards))
-    client = OpenAI()
-
+    # client = OpenAI()   # ← remove
     user_blob = f"PAGE: {page_no}\n"
     if section:
         user_blob += f"SECTION: {section}\n"
     user_blob += "\nTEXT:\n" + chunk_text
 
-    resp = client.chat.completions.create(
+    resp = CLIENT.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": prompt},
