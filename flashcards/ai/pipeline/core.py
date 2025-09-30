@@ -107,8 +107,8 @@ def cards_from_document(
     cache_chunks: bool = True,
     concurrency: int = DEFAULT_CONCURRENCY,
     sections_plan: Optional[List[Dict[str, Any]]] = None,
-) -> List[dict]:
-
+    return_template: bool = False,   # ← NEW
+):
     raw = run_extraction(path, max_tokens=max_tokens)
     chunks = _normalize_chunks(raw)
     log.info("core: %s chunk(s) ready", len(chunks))
@@ -126,6 +126,7 @@ def cards_from_document(
         except Exception as e:
             log.warning("Could not write chunk cache %s: %s", cache, e)
 
+    # Build the LLM study template once here
     template = build_template_from_chunks(
         chunks,
         title=path.stem if hasattr(path, "stem") else "Document",
@@ -133,7 +134,7 @@ def cards_from_document(
     )
     sections: List[dict] = template.get("sections", []) or []
     if not sections:
-        return []
+        return ([], template) if return_template else []
 
     # targets
     targets: Dict[str, int] = {}
@@ -188,7 +189,7 @@ def cards_from_document(
                 except Exception as e:
                     log.warning("core: section worker failed: %s", e)
     else:
-        return []
+        return ([], template) if return_template else []
 
     # dedupe & order
     cards: list[dict] = []
@@ -218,20 +219,19 @@ def cards_from_document(
             cards.append(c)
             kept += 1
 
-    # global catch-up (one extra call) if we undershot
+    # global catch-up if we undershot
     if total_cards is not None and len(cards) < int(total_cards):
         need = int(total_cards) - len(cards)
-        # Build a compact mixed seed from all sections' QA lines (unique)
         lines = []
         seen_line = set()
         for sec in sections:
-            blob = _fallback_text_from_items(sec, 2000)  # small slice per section
+            blob = _fallback_text_from_items(sec, 2000)
             for ln in blob.splitlines():
                 ln = ln.strip()
                 if ln and ln.lower() not in seen_line:
                     seen_line.add(ln.lower())
                     lines.append(ln)
-        seed_mixed = "\n".join(lines[:800])  # cap lines
+        seed_mixed = "\n".join(lines[:800])
         mix_text = _mix_text("", seed_mixed, MAX_CHARS_SINGLE)
         if mix_text:
             extra = _cards_from_chunk(mix_text, page_no=1, section="Mixed topics", max_cards=need)
@@ -247,7 +247,7 @@ def cards_from_document(
                 c["card_key"] = k
                 c.setdefault("section", "Mixed topics")
                 c.setdefault("page", 1)
-                c["ordinal"] = 9_000_000 + len(cards)  # after all sections
+                c["ordinal"] = 9_000_000 + len(cards)
                 cards.append(c)
                 if len(cards) >= int(total_cards):
                     break
@@ -255,4 +255,7 @@ def cards_from_document(
     if total_cards is not None and len(cards) > int(total_cards):
         cards = cards[: int(total_cards)]
 
+    # ← NEW: return template when asked
+    if return_template:
+        return cards, template
     return cards

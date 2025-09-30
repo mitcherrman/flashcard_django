@@ -164,13 +164,13 @@ def generate_deck(request):
                 })
 
         # build cards from the PDF — UPDATED call (matches new core.py)
-        cards = cards_from_document(
+        cards, template = cards_from_document(
             tmp_path,
             total_cards=total_cards,
             max_tokens=500,
-            sections_plan=sections_plan,          # heading→next heading slices (templater)
-            max_cards_per_section=MAX_PER_SECTION, # hard cap per section
-            concurrency=8,
+            sections_plan=sections_plan,
+            max_cards_per_section=MAX_PER_SECTION,
+            return_template=True,   # ← ask core to give us the LLM outline
         )
         if not cards:
             raise RuntimeError("Model returned zero cards.")
@@ -225,6 +225,7 @@ def generate_deck(request):
         return Response(
             {
                 "deck_id": deck.id,
+                "template": template or {},
                 "cards_created": created,
                 "requested": total_cards,
                 "warnings": warnings,
@@ -238,6 +239,7 @@ def generate_deck(request):
                 ],
             },
             status=201,
+            
         )
 
     except Exception as exc:
