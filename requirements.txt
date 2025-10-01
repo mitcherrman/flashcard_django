@@ -1,9 +1,22 @@
-pymupdf==1.26.3
+# ── Django + DRF ─────────────────────────────────────────────────────────────
+Django==5.0.4
+djangorestframework==3.16.0
+django-cors-headers==4.4.0     # (optional) if you enable CORS
+
+# ── OpenAI + token counting ──────────────────────────────────────────────────
 openai==1.96.1
-Pillow==11.3.0
-pytesseract==0.3.13
-python-decouple==3.8
-python_docx==1.1.2
 tiktoken==0.7.0
-Django==5.0.4                 # web framework
-djangorestframework==3.16.0   # JSON API layer (DRF)
+python-decouple==3.8             # for OPENAI_API_KEY, etc.
+
+# ── PDF / OCR pipeline ───────────────────────────────────────────────────────
+pymupdf==1.26.3                  # PyMuPDF: fast PDF text & images
+Pillow==11.3.0                   # image IO for OCR
+pytesseract==0.3.13              # wraps the Tesseract binary (install OS package too)
+
+# ── DOCX support (your code imports python_docx/python-docx) ────────────────
+python-docx==1.1.2               # package name uses a dash on PyPI
+
+# ── (optional) production helpers ────────────────────────────────────────────
+# gunicorn==21.2.0               # WSGI server (Linux/macOS)
+# whitenoise==6.7.0              # serve static files
+# psycopg2-binary==2.9.9         # Postgres driver (or psycopg==3.2.1)
