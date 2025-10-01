@@ -2,9 +2,10 @@ from __future__ import annotations
 import json, logging, hashlib, re
 from typing import List, Optional
 from openai import OpenAI
+from django.conf import settings
 
 log = logging.getLogger(__name__)
-CLIENT = OpenAI()  
+CLIENT = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
 def build_card_key(front: str, back: str) -> str:
