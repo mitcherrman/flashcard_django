@@ -4,7 +4,7 @@ from typing import List, Tuple, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..driver         import run_extraction
-from ..flashcard_gen  import _cards_from_chunk, build_card_key
+from ..flashcard_gen  import cards_from_chunk, build_card_key
 from .templater       import build_template_from_chunks
 
 log = logging.getLogger(__name__)
@@ -162,12 +162,12 @@ def cards_from_document(
         if not text:
             text = title  # last resort
 
-        out = _cards_from_chunk(text, page_no=page_start, section=title, max_cards=target)
+        out = cards_from_chunk(text, page_no=page_start, section=title, max_cards=target)
 
         # top-up once if short
         if isinstance(out, list) and len(out) < target and target > 0:
             need = target - len(out)
-            more = _cards_from_chunk(text, page_no=page_start, section=title, max_cards=need)
+            more = cards_from_chunk(text, page_no=page_start, section=title, max_cards=need)
             if isinstance(more, list) and more:
                 out.extend(more[:need])
 
@@ -234,7 +234,7 @@ def cards_from_document(
         seed_mixed = "\n".join(lines[:800])
         mix_text = _mix_text("", seed_mixed, MAX_CHARS_SINGLE)
         if mix_text:
-            extra = _cards_from_chunk(mix_text, page_no=1, section="Mixed topics", max_cards=need)
+            extra = cards_from_chunk(mix_text, page_no=1, section="Mixed topics", max_cards=need)
             for c in extra or []:
                 front = (c.get("front") or "").strip()
                 back  = (c.get("back")  or "").strip()

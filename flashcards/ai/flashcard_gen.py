@@ -122,7 +122,7 @@ def _ask_openai(chunk_text: str, page_no: int, section: Optional[str], max_cards
 
     return []
 
-def _cards_from_chunk(
+def cards_from_chunk(
     chunk_text: str,
     page_no: int,
     section: Optional[str] = None,
