@@ -128,10 +128,11 @@ def cards_from_document(
 
     # Build the LLM study template once here
     template = build_template_from_chunks(
-        chunks,
+        raw,   # ← pass raw (not normalized), it contains titles
         title=path.stem if hasattr(path, "stem") else "Document",
         path=path,
     )
+
     sections: List[dict] = template.get("sections", []) or []
     if not sections:
         return ([], template) if return_template else []

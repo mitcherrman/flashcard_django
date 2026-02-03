@@ -20,3 +20,7 @@ python-docx==1.1.2               # package name uses a dash on PyPI
 # gunicorn==21.2.0               # WSGI server (Linux/macOS)
 # whitenoise==6.7.0              # serve static files
 # psycopg2-binary==2.9.9         # Postgres driver (or psycopg==3.2.1)
+
+celery[redis]==5.3.6
+django-celery-results==2.5.1
+redis==5.0.1

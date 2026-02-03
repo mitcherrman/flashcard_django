@@ -33,8 +33,6 @@ DEBUG = bool(int(os.getenv("DEBUG", 1)))
 # ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
 ALLOWED_HOSTS = ["*"]   # dev‑only
 
-CORS_ALLOW_ALL_ORIGINS = True
-
 # Application definition
 
 INSTALLED_APPS = [
@@ -47,6 +45,7 @@ INSTALLED_APPS = [
     'corsheaders',
     'rest_framework',   # DRF (Django REST Framework) 
     'flashcards',
+    "django_celery_results",
 ]
 
 MIDDLEWARE = [
@@ -153,8 +152,6 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 MEDIA_URL  = "/media/"
 MEDIA_ROOT = BASE_DIR / "uploads"
 
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
@@ -176,3 +173,50 @@ LOGGING = {
     },
 }
 
+# -----------------------------------------------------------------------------
+# Celery / Async processing
+# -----------------------------------------------------------------------------
+# DEV-ONLY QUICK TEST (no Redis needed):
+# By default we use Celery's in-memory broker+backend so you can test immediately.
+# This runs a real Celery worker process, but stores tasks/results in memory.
+# To use this dev setup, do:
+#   1) pip install celery django-celery-results
+#   2) Start worker in another terminal:  celery -A flashsite worker -l info
+#   3) Run Django:                        python manage.py runserver
+#
+# When you're ready to switch to Redis:
+#   - Run Redis locally (Docker: `docker run -p 6379:6379 -d redis:7-alpine`)
+#   - Set environment variable: CELERY_DEV_MEMORY=0
+#   - (optional) Customize CELERY_BROKER_URL / CELERY_RESULT_BACKEND
+#       e.g. CELERY_BROKER_URL=redis://localhost:6379/0
+#            CELERY_RESULT_BACKEND=redis://localhost:6379/1
+#
+USE_CELERY_MEMORY_BROKER = os.getenv("CELERY_DEV_MEMORY", "1") == "1"
+
+if USE_CELERY_MEMORY_BROKER:
+    # In-memory broker + in-memory backend (dev-only)
+    CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+    CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/1"
+else:
+    # Redis (recommended for real async)
+    CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+    CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+
+# Always run tasks asynchronously (do NOT set True here if you want real async)
+# Leave this False so API requests enqueue work and return immediately.
+CELERY_TASK_ALWAYS_EAGER = False
+
+# Sensible Celery defaults
+CELERY_TASK_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TIMEZONE = "UTC"  # or your TIME_ZONE if you have one set above
+CELERY_TASK_TIME_LIMIT = 60 * 15  # hard limit (15 min)
+CELERY_TASK_SOFT_TIME_LIMIT = 60 * 12  # soft limit (12 min)
+
+# django-celery-results configuration (uses your default DB)
+# Run: python manage.py migrate django_celery_results
+
+CELERY_TASK_ACKS_LATE = False              # ack immediately on receipt
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1      # one message at a time
+CELERY_BROKER_TRANSPORT_OPTIONS = {"visibility_timeout": 3600}  # 1h safety net
