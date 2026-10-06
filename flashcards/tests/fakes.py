@@ -26,6 +26,11 @@ def fact_line(page: int, n: int) -> str:
     return f"Fact P{page}-{n}: The marker for page {page} item {n} is token{page}x{n}."
 
 
+def paraphrase_of(n: int) -> str:
+    """A faithful-sounding excerpt that shares no 4+ word run with any page."""
+    return f"In other words, entry {n} here carries its own distinctive token."
+
+
 def make_pdf(page_count: int, *, toc=None, facts_per_page: int = 3) -> bytes:
     """PDF bytes with `facts_per_page` traceable facts on every page."""
     doc = fitz.open()
@@ -52,9 +57,10 @@ def _after(marker: str, text: str) -> str:
 class FakeOpenAI:
     """Deterministic stand-in for `openai.OpenAI` (chat.completions only)."""
 
-    def __init__(self, *, notoc_titles: dict[int, str] | None = None):
+    def __init__(self, *, notoc_titles: dict[int, str] | None = None, paraphrase: bool = False):
         self.calls: list[dict] = []
         self.notoc_titles = notoc_titles or {}
+        self.paraphrase = paraphrase  # excerpts that cannot be found verbatim
         self._served: dict[tuple, int] = defaultdict(int)
         self._lock = threading.Lock()
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
@@ -102,7 +108,7 @@ class FakeOpenAI:
                 {
                     "front": f"What is the marker for page {p} item {n}?",
                     "back": rest.rsplit(" is ", 1)[-1],
-                    "excerpt": sentence,
+                    "excerpt": paraphrase_of(int(n)) if self.paraphrase else sentence,
                 }
                 for sentence, p, n, rest in facts
             ]

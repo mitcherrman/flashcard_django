@@ -12,11 +12,12 @@ import tempfile
 from unittest import mock
 
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIClient
 
+from flashcards.ai.pipeline.core import _grounded_page, _words
 from flashcards.models import Card
-from flashcards.tests.fakes import FACT_RE, FakeOpenAI, fact_pages, make_pdf
+from flashcards.tests.fakes import FACT_RE, FakeOpenAI, fact_line, fact_pages, make_pdf, paraphrase_of
 
 ANALYZE = "/api/flashcards/analyze/"
 GENERATE = "/api/flashcards/generate/"
@@ -258,3 +259,60 @@ class TempAndErrorHygieneTests(PipelineTestCase):
             self.assertNotIn(self.tmpdir.replace("\\", "/"), detail)
             self.assertNotIn("tmp", detail.replace(self.tmpdir, ""))
         self.assertEqual(list(pathlib.Path(self.tmpdir).iterdir()), [])
+
+
+class PageGroundingPolicyTests(SimpleTestCase):
+    """_grounded_page: a page is claimed only when the pipeline can ground it."""
+
+    # Normalised text of a 6-page synthetic document (3 facts per page).
+    PAGES = [" " + " ".join(_words(" ".join(fact_line(p, n) for n in (1, 2, 3)))) + " "
+             for p in range(1, 7)]
+
+    @staticmethod
+    def sec(ps, pe, source="toc"):
+        return {"title": "S", "page_start": ps, "page_end": pe, "page_source": source}
+
+    def test_a_exact_excerpt_in_multi_page_section_returns_its_page(self):
+        card = {"excerpt": fact_line(3, 2)}
+        self.assertEqual(_grounded_page(card, self.sec(1, 4), self.PAGES), 3)
+
+    def test_b_unmatched_excerpt_in_multi_page_section_is_unknown(self):
+        card = {"excerpt": paraphrase_of(2)}
+        self.assertIsNone(_grounded_page(card, self.sec(1, 4), self.PAGES))
+
+    def test_b_model_echoed_page_is_not_provenance(self):
+        card = {"excerpt": paraphrase_of(2), "page": 2}
+        self.assertIsNone(_grounded_page(card, self.sec(1, 4), self.PAGES))
+
+    def test_b_excerpt_outside_the_section_range_is_not_used(self):
+        card = {"excerpt": fact_line(6, 1)}  # real text, but from another section's page
+        self.assertIsNone(_grounded_page(card, self.sec(1, 4), self.PAGES))
+
+    def test_c_unmatched_excerpt_in_single_page_section_returns_that_page(self):
+        card = {"excerpt": paraphrase_of(1)}
+        self.assertEqual(_grounded_page(card, self.sec(5, 5), self.PAGES), 5)
+
+    def test_d_no_real_range_is_unknown_unless_excerpt_is_found(self):
+        unmatched = {"excerpt": paraphrase_of(1)}
+        self.assertIsNone(_grounded_page(unmatched, self.sec(1, 3, "estimated"), self.PAGES))
+        self.assertIsNone(_grounded_page(unmatched, None, self.PAGES))
+        # Rule 4: a verbatim excerpt is independent grounding, wherever it is.
+        found = {"excerpt": fact_line(4, 3)}
+        self.assertEqual(_grounded_page(found, self.sec(1, 3, "estimated"), self.PAGES), 4)
+        self.assertEqual(_grounded_page(found, None, self.PAGES), 4)
+
+
+class ParaphrasedExcerptTests(PipelineTestCase):
+    fake_kwargs = {"paraphrase": True}
+
+    def test_unmatched_excerpts_get_no_fake_page(self):
+        res = self.generate(make_pdf(6, toc=UNEVEN_TOC),
+                            allocations=self.allocations({"Cells": 4, "Photosynthesis": 2, "Respiration": 2}))
+        self.assertEqual(res.status_code, 201, res.content)
+        deck_id = res.json()["deck_id"]
+        pages = {(c.section, c.page) for c in Card.objects.filter(deck_id=deck_id)}
+        # Cells spans 1–4 → unknown (not page 1); single-page sections keep their page.
+        self.assertEqual(pages, {("Cells", None), ("Photosynthesis", 5), ("Respiration", 6)})
+        hand = self.client.get("/api/flashcards/hand/", {"deck_id": deck_id, "n": "all", "order": "doc"}).json()
+        self.assertEqual([c["ordinal"] for c in hand], list(range(1, 9)))
+        self.assertEqual([c["section"] for c in hand][-4:], ["Cells"] * 4)  # unknown pages sort last

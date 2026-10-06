@@ -117,16 +117,21 @@ def _locate_excerpt(excerpt: str, norm_pages: List[str], lo: int, hi: int) -> Op
 
 def _grounded_page(card: dict, sec: Optional[dict], norm_pages: List[str]) -> Optional[int]:
     """
-    Card page policy: the page within the section's real range where the
-    excerpt is found; else the section's first page. Without a real range
-    the excerpt may be located anywhere in the document; else None.
+    Card page policy (the model's echoed page is never used):
+      1. the page within the section's real range where the excerpt is found;
+      2. else the section's only page, if its real range is a single page;
+      3. else None — a multi-page section does not imply a page;
+      4. without a real range, only an excerpt located verbatim anywhere in
+         the document grounds a page; else None.
     """
     rng = _real_range(sec) if sec else None
     lo, hi = rng if rng else (1, len(norm_pages))
     found = _locate_excerpt(card.get("excerpt") or "", norm_pages, lo, hi)
     if found is not None:
         return found
-    return rng[0] if rng else None
+    if rng and rng[0] == rng[1]:
+        return rng[0]
+    return None
 
 def _fallback_text_from_items(sec: dict, max_chars: int = MAX_CHARS_SINGLE) -> str:
     out: List[str] = []
