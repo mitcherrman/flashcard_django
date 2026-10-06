@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from django.conf import settings
@@ -57,6 +57,9 @@ class Section:
     bullets: List[Bullet]
     page_start: Optional[int] = None
     page_end: Optional[int] = None
+    # "toc" = PDF outline range, "page" = the page chunk it was generated from,
+    # "estimated" = no page metadata; evenly divided approximation.
+    page_source: Optional[str] = None
 
 # --------------------------------------------------------------------
 # LLM call – we keep your simple intent, but request strict JSON so parsing is reliable
@@ -161,6 +164,9 @@ def _ask_llm_sections(
 def _merge_sections(base: List[Section], extra: List[Section]) -> List[Section]:
     """
     Merge by normalized title; keep up to 6 bullets per section.
+    A merged section's page range only grows over contiguous/overlapping
+    ranges; otherwise it keeps the first range rather than spanning pages
+    that belong to other sections.
     """
     by_key: Dict[str, Section] = {}
     for s in base:
@@ -173,8 +179,13 @@ def _merge_sections(base: List[Section], extra: List[Section]) -> List[Section]:
             missing = max(0, 6 - len(existing.bullets))
             if missing > 0:
                 existing.bullets.extend(s.bullets[:missing])
+            if (None not in (existing.page_start, existing.page_end, s.page_start, s.page_end)
+                    and s.page_start <= existing.page_end + 1
+                    and s.page_end >= existing.page_start - 1):
+                existing.page_start = min(existing.page_start, s.page_start)
+                existing.page_end = max(existing.page_end, s.page_end)
         else:
-            by_key[k] = Section(title=s.title, bullets=s.bullets[:6])
+            by_key[k] = replace(s, bullets=s.bullets[:6])
 
     # Preserve original input order as best we can
     out: List[Section] = []
@@ -201,33 +212,36 @@ def build_template_from_chunks(
     extracted = []
     if path:
         try:
-            extracted = run_extraction(path, max_tokens=MAX_TOKENS_CHUNK)  # [(text, page_start, section_title|None)]
+            extracted = run_extraction(path, max_tokens=MAX_TOKENS_CHUNK)  # [(text, page_start, section_title|None, page_end)]
         except Exception as e:
             log.warning("run_extraction failed (TOC-aware): %s", e)
             extracted = []
 
     # If we got multiple logical chunks (TOC sections or page slices), prefer parallel section templating.
-    if extracted and (len(extracted) > 1 or any(t for _, __, t in extracted)):
+    if extracted and (len(extracted) > 1 or any(t for _, __, t, *___ in extracted)):
         # Parallelize per-chunk templating for speed
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         merged: List[Section] = []
         futs = []
         with ThreadPoolExecutor(max_workers=min(6, len(extracted))) as ex:
-            for (chunk_text, page_start, sec_title) in extracted:
+            for (chunk_text, page_start, sec_title, page_end) in extracted:
+                hint = sec_title if isinstance(sec_title, str) and sec_title.strip() else None
                 fut = ex.submit(
                     _ask_llm_sections,
                     chunk_text,
                     title_hint=title,
-                    section_hint=sec_title if isinstance(sec_title, str) and sec_title.strip() else None,
+                    section_hint=hint,
                 )
-                futs.append((fut, page_start))
-            for fut, page_start in futs:
+                futs.append((fut, page_start, page_end, "toc" if hint else "page"))
+            for fut, page_start, page_end, source in futs:
                 try:
                     secs = fut.result() or []
+                    # The chunk's real (TOC or page) range is authoritative.
                     for s in secs:
-                        s.page_start = int(page_start) if page_start is not None else None
-                        s.page_end = None
+                        s.page_start = int(page_start)
+                        s.page_end = max(int(page_start), int(page_end))
+                        s.page_source = source
                     merged = _merge_sections(merged, secs)
                 except Exception as e:
                     log.warning("templater chunk failed: %s", e)
@@ -272,15 +286,17 @@ def _template_from_sections(sections: List[Section], *, pages: int, title: str) 
     out_sections: List[Dict[str, Any]] = []
     toc: List[Dict[str, Any]] = []
 
-    # Precompute default ranges if any section lacks page metadata
+    # Approximate ranges, used ONLY for sections with no real page metadata
     defaults = _even_ranges(len(sections), pages)
 
     for idx, s in enumerate(sections):
-        # Fill missing page ranges with even partitions
         ps = s.page_start if isinstance(s.page_start, int) else None
         pe = s.page_end   if isinstance(s.page_end,   int) else None
+        source = s.page_source
         if ps is None or pe is None:
             ps, pe = defaults[idx]
+            # A one-page document has only one possible range.
+            source = "page" if int(pages or 1) <= 1 else "estimated"
 
         items: List[Dict[str, Any]] = []
         first_ord = ordinal
@@ -299,6 +315,7 @@ def _template_from_sections(sections: List[Section], *, pages: int, title: str) 
             "title": s.title or "Section",
             "page_start": ps,
             "page_end": pe,
+            "page_source": source,
             "items": items,
         })
 
@@ -306,6 +323,7 @@ def _template_from_sections(sections: List[Section], *, pages: int, title: str) 
             "title": s.title or "Section",
             "page_start": ps,
             "page_end": pe,
+            "page_source": source,
             "ordinal_first": first_ord,
         })
 

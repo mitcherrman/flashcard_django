@@ -26,6 +26,16 @@ from .ai.flashcard_gen import build_card_key
 log = logging.getLogger(__name__)
 
 
+def _public_error(exc: Exception, tmp_path: Optional[pathlib.Path], upload_name: str) -> str:
+    """Exception text for API responses, with the server temp path replaced by
+    the uploaded file's name (the full exception is still logged)."""
+    msg = str(exc)
+    if tmp_path:
+        for p in (str(tmp_path), tmp_path.as_posix(), str(tmp_path).replace("\\", "\\\\")):
+            msg = msg.replace(p, upload_name)
+    return msg
+
+
 # ────────────────────────────────────────────────────────────────────────────
 #  /api/flashcards/analyze/  – quick document stats for the UI
 # ────────────────────────────────────────────────────────────────────────────
@@ -50,7 +60,7 @@ def analyze(request):
         return Response(stats, status=200)
     except Exception as e:
         log.exception("analyze failed")
-        return Response({"detail": f"analyze failed: {e}"}, status=500)
+        return Response({"detail": f"analyze failed: {_public_error(e, tmp_path, up.name)}"}, status=500)
     finally:
         try:
             if tmp_path:
@@ -171,6 +181,7 @@ def generate_deck(request):
             sections_plan=sections_plan,
             max_cards_per_section=MAX_PER_SECTION,
             return_template=True,   # ← ask core to give us the LLM outline
+            title=deck_name,        # template title = deck name, not the temp-file stem
         )
         if not cards:
             raise RuntimeError("Model returned zero cards.")
@@ -203,6 +214,13 @@ def generate_deck(request):
                     distractors=c.get("distractors") or [],
                 )
             )
+        # Ordinal = 1-based position in document order, the same order that
+        # hand?order=doc and toc use (page ASC, unknown pages last, then id).
+        # The sort is stable, so ties keep pipeline (section) order, and ids
+        # are assigned in this order too.
+        objs.sort(key=lambda o: (o.page is None, o.page or 0))
+        for i, o in enumerate(objs, start=1):
+            o.ordinal = i
         Card.objects.bulk_create(objs, ignore_conflicts=True)
 
         # Optional: keep the warnings UI you already wired up
@@ -244,13 +262,15 @@ def generate_deck(request):
 
     except Exception as exc:
         log.exception("Deck build failed")
-        return Response({"detail": f"Deck build failed: {exc!s}"}, status=500)
+        return Response({"detail": f"Deck build failed: {_public_error(exc, tmp_path, up.name)}"}, status=500)
     finally:
-        try:
-            if tmp_path:
-                tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if tmp_path:
+            # the upload, and the chunk cache cards_from_document writes beside it
+            for p in (tmp_path, tmp_path.with_suffix(".chunks.pkl")):
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -76,10 +76,10 @@ def _normalize_distractors(correct: str, raw) -> list[str]:
                 break
     return out[:3]
 
-def _ask_openai(chunk_text: str, page_no: int, section: Optional[str], max_cards: int) -> List[dict]:
+def _ask_openai(chunk_text: str, page_no: Optional[int], section: Optional[str], max_cards: int) -> List[dict]:
     prompt = SYSTEM_PROMPT.replace("MAX_CARDS", str(max_cards))
     # client = OpenAI()   # ← remove
-    user_blob = f"PAGE: {page_no}\n"
+    user_blob = f"PAGE: {page_no}\n" if page_no is not None else ""
     if section:
         user_blob += f"SECTION: {section}\n"
     user_blob += "\nTEXT:\n" + chunk_text
@@ -124,7 +124,7 @@ def _ask_openai(chunk_text: str, page_no: int, section: Optional[str], max_cards
 
 def cards_from_chunk(
     chunk_text: str,
-    page_no: int,
+    page_no: Optional[int],
     section: Optional[str] = None,
     max_cards: int = 3,
 ) -> List[dict]:
@@ -157,7 +157,8 @@ def cards_from_chunk(
 
     # Guarantee metadata and normalize distractors
     for c in have:
-        c.setdefault("page", page_no)
+        if page_no is not None:  # unknown page stays unknown
+            c.setdefault("page", page_no)
         if section:
             c.setdefault("section", section)
 

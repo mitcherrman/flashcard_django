@@ -3,7 +3,7 @@ import pathlib, random, pickle, json, logging, re
 from typing import List, Tuple, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ..driver         import run_extraction
+from ..driver         import run_extraction, page_texts
 from ..flashcard_gen  import cards_from_chunk, build_card_key
 from .templater       import build_template_from_chunks
 
@@ -57,20 +57,76 @@ def _norm(s: str) -> str:
     s = re.sub(r"[^\w\s&:+/().,'’\-^*=\[\]{}|]", "", s)
     return s.strip()
 
-def _section_text_from_pages(sec: dict, chunks: List[Tuple[str, int]], max_chars: int = MAX_CHARS_SINGLE) -> str:
-    ps = sec.get("page_start")
-    pe = sec.get("page_end")
-    if not (isinstance(ps, int) and isinstance(pe, int) and ps <= pe):
-        return ""  # << critical change: no bogus page=1 fallback; force item-based text
+def _chunk_spans(raw_chunks, chunks: List[Tuple[str, int]]) -> List[Tuple[str, int, int, Optional[str]]]:
+    """(text, page_start, page_end, title|None) for each normalized chunk."""
+    spans = []
+    for item, (txt, ps) in zip(raw_chunks or [], chunks):
+        title, pe = None, ps
+        if isinstance(item, (tuple, list)) and len(item) >= 4:
+            title = item[2] if isinstance(item[2], str) and item[2].strip() else None
+            pe = item[3] if isinstance(item[3], int) else ps
+        spans.append((txt, ps, max(ps, pe), title))
+    return spans
+
+def _real_range(sec: dict) -> Optional[Tuple[int, int]]:
+    """The section's page range, or None when it is only an estimate."""
+    ps, pe = sec.get("page_start"), sec.get("page_end")
+    if sec.get("page_source") == "estimated":
+        return None
+    if isinstance(ps, int) and isinstance(pe, int) and ps <= pe:
+        return ps, pe
+    return None
+
+def _section_text_from_pages(sec: dict, spans, max_chars: int = MAX_CHARS_SINGLE) -> str:
+    rng = _real_range(sec)
+    if rng is None:
+        return ""  # no real range: use seed items only, never a guessed page slice
+    ps, pe = rng
+    # Prefer the section's own chunk (TOC entries can share a start page),
+    # otherwise every chunk lying wholly inside the section's range.
+    key = _norm(sec.get("title") or "")
+    picked = [s for s in spans if s[3] and _norm(s[3]) == key and ps <= s[1] <= pe]
+    if not picked:
+        picked = [s for s in spans if ps <= s[1] and s[2] <= pe]
     parts: List[str] = []
-    for txt, pg in chunks:
-        ip = int(pg)
-        if ps <= ip <= pe:
-            t = (txt or "").strip()
-            if t:
-                parts.append(t)
+    for txt, *_ in picked:
+        t = (txt or "").strip()
+        if t:
+            parts.append(t)
     joined = "\n\n".join(parts).strip()
     return joined[:max_chars] if len(joined) > max_chars else joined
+
+_WORD_RE = re.compile(r"\w+")
+
+def _words(s: str) -> List[str]:
+    return _WORD_RE.findall((s or "").lower())
+
+def _locate_excerpt(excerpt: str, norm_pages: List[str], lo: int, hi: int) -> Optional[int]:
+    """First page in [lo, hi] whose text contains the card's excerpt (or its
+    first/last 8 words) verbatim, ignoring case/punctuation/whitespace."""
+    words = _words(excerpt)
+    if len(words) < 4:
+        return None
+    needles = [words] if len(words) <= 8 else [words[:8], words[-8:]]
+    for needle in needles:
+        pat = " " + " ".join(needle) + " "
+        for p in range(max(1, lo), min(hi, len(norm_pages)) + 1):
+            if pat in norm_pages[p - 1]:
+                return p
+    return None
+
+def _grounded_page(card: dict, sec: Optional[dict], norm_pages: List[str]) -> Optional[int]:
+    """
+    Card page policy: the page within the section's real range where the
+    excerpt is found; else the section's first page. Without a real range
+    the excerpt may be located anywhere in the document; else None.
+    """
+    rng = _real_range(sec) if sec else None
+    lo, hi = rng if rng else (1, len(norm_pages))
+    found = _locate_excerpt(card.get("excerpt") or "", norm_pages, lo, hi)
+    if found is not None:
+        return found
+    return rng[0] if rng else None
 
 def _fallback_text_from_items(sec: dict, max_chars: int = MAX_CHARS_SINGLE) -> str:
     out: List[str] = []
@@ -108,15 +164,24 @@ def cards_from_document(
     concurrency: int = DEFAULT_CONCURRENCY,
     sections_plan: Optional[List[Dict[str, Any]]] = None,
     return_template: bool = False,   # ← NEW
+    title: Optional[str] = None,
 ):
     raw = run_extraction(path, max_tokens=max_tokens)
     chunks = _normalize_chunks(raw)
+    spans = _chunk_spans(raw, chunks)
     log.info("core: %s chunk(s) ready", len(chunks))
 
     if sample_chunks:
-        k = min(sample_chunks, len(chunks))
-        chunks = random.sample(chunks, k)
+        k = min(sample_chunks, len(spans))
+        spans = random.sample(spans, k)
+        chunks = [(t, ps) for t, ps, *_ in spans]
         log.debug("Sampled %s random chunk(s) for test/demo", len(chunks))
+
+    try:
+        norm_pages = [" " + " ".join(_words(t)) + " " for t in page_texts(path)]
+    except Exception as e:
+        log.warning("core: could not read page text for grounding: %s", e)
+        norm_pages = []
 
     if cache_chunks:
         cache = path.with_suffix(".chunks.pkl")
@@ -129,7 +194,7 @@ def cards_from_document(
     # Build the LLM study template once here
     template = build_template_from_chunks(
         chunks,
-        title=path.stem if hasattr(path, "stem") else "Document",
+        title=title or (path.stem if hasattr(path, "stem") else "Document"),
         path=path,
     )
     sections: List[dict] = template.get("sections", []) or []
@@ -154,9 +219,10 @@ def cards_from_document(
     # worker
     def _gen_for_section(sec_index: int, sec: dict, target: int) -> tuple[int, list[dict]]:
         title = sec.get("title") or ""
-        page_start = int(sec.get("page_start") or 1)
+        rng = _real_range(sec)
+        page_start = rng[0] if rng else None  # no PAGE hint when the range is a guess
 
-        page_text = _section_text_from_pages(sec, chunks, MAX_CHARS_SINGLE)
+        page_text = _section_text_from_pages(sec, spans, MAX_CHARS_SINGLE)
         seed = _fallback_text_from_items(sec, MAX_CHARS_SINGLE)
         text = _mix_text(page_text, seed, MAX_CHARS_SINGLE)
         if not text:
@@ -209,12 +275,9 @@ def cards_from_document(
             seen_keys.add(k)
             c["card_key"] = k
             sec = sections[sec_index]
-            c.setdefault("section", sec.get("title") or "")
-            try:
-                pg = int(c.get("page")) if isinstance(c.get("page"), int) else int(sec.get("page_start") or 1)
-            except Exception:
-                pg = int(sec.get("page_start") or 1)
-            c["page"] = pg
+            # Provenance is the section job the card came from, not the model's echo.
+            c["section"] = sec.get("title") or c.get("section") or ""
+            c["page"] = _grounded_page(c, sec, norm_pages)
             c["ordinal"] = base_ord + kept
             cards.append(c)
             kept += 1
@@ -234,7 +297,7 @@ def cards_from_document(
         seed_mixed = "\n".join(lines[:800])
         mix_text = _mix_text("", seed_mixed, MAX_CHARS_SINGLE)
         if mix_text:
-            extra = cards_from_chunk(mix_text, page_no=1, section="Mixed topics", max_cards=need)
+            extra = cards_from_chunk(mix_text, page_no=None, section="Mixed topics", max_cards=need)
             for c in extra or []:
                 front = (c.get("front") or "").strip()
                 back  = (c.get("back")  or "").strip()
@@ -245,8 +308,8 @@ def cards_from_document(
                     continue
                 seen_keys.add(k)
                 c["card_key"] = k
-                c.setdefault("section", "Mixed topics")
-                c.setdefault("page", 1)
+                c["section"] = "Mixed topics"
+                c["page"] = _grounded_page(c, None, norm_pages)  # unknown → None, not page 1
                 c["ordinal"] = 9_000_000 + len(cards)
                 cards.append(c)
                 if len(cards) >= int(total_cards):
