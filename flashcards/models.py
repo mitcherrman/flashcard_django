@@ -1,13 +1,26 @@
+import re
+import secrets
+
 from django.db import models
 from django.contrib.auth import get_user_model
 
 User = get_user_model()
+
+# A deck's public id: 128 random bits, URL-safe (22 characters). The API
+# only ever accepts and returns this; the integer primary key stays internal,
+# so decks can't be found by counting.
+PUBLIC_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,32}")
+
+
+def new_public_id() -> str:
+    return secrets.token_urlsafe(16)
 
 
 class Deck(models.Model):
     user    = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
     name    = models.CharField(max_length=200)
     created = models.DateTimeField(auto_now_add=True)
+    public_id = models.CharField(max_length=32, unique=True, editable=False, default=new_public_id)
 
 
 class Card(models.Model):

@@ -12,7 +12,8 @@ urlpatterns = [
     # Deck building + gameplay
     path("generate/", views.generate_deck, name="generate"),
     path("hand/",     views.hand,          name="hand"),
-    path("feedback/", views.feedback,      name="feedback"),
+    # /feedback/ was removed in F5: no client used it, anonymous POSTs always
+    # got 403, and its counters were global across every visitor.
     path("health/",   views.health,        name="health"),
     path("toc/",      views.toc,           name="toc"),
     

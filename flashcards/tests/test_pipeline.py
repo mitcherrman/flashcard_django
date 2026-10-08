@@ -11,6 +11,7 @@ import shutil
 import tempfile
 from unittest import mock
 
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase, TestCase
 from rest_framework.test import APIClient
@@ -43,14 +44,11 @@ class PipelineTestCase(TestCase):
             mock.patch("flashcards.ai.pipeline.templater.OpenAI", lambda *a, **k: self.fake),
             mock.patch("flashcards.ai.flashcard_gen.CLIENT", self.fake),
             mock.patch("httpx.Client.send", side_effect=AssertionError("network access in tests")),
-            # Tests run with DEBUG=False, which enables Django's mail_admins
-            # handler on 5xx; on Python 3.14 Django 5.0's traceback rendering
-            # crashes (Context.__copy__). Not under test here — see handoff.
-            mock.patch("django.utils.log.AdminEmailHandler.emit"),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
+        cache.clear()  # throttle and generation-budget counters
 
         # Route the views' temp files into a private dir so leaks are observable.
         self.tmpdir = tempfile.mkdtemp(prefix="flash-f05-")
@@ -135,7 +133,7 @@ class SectionSourcingTests(PipelineTestCase):
         res = self.generate(make_pdf(6, toc=UNEVEN_TOC),
                             allocations=self.allocations({"Cells": 6, "Photosynthesis": 2, "Respiration": 2}))
         deck_id = res.json()["deck_id"]
-        cards = list(Card.objects.filter(deck_id=deck_id))
+        cards = list(Card.objects.filter(deck__public_id=deck_id))
         self.assertEqual(len(cards), 10)
         for c in cards:
             lo, hi = UNEVEN_RANGES[c.section]
@@ -165,7 +163,7 @@ class SectionSourcingTests(PipelineTestCase):
         tpl = res.json()["template"]
         self.assertEqual([(s["page_start"], s["page_end"], s["page_source"]) for s in tpl["sections"]],
                          [(1, 1, "page"), (2, 2, "page"), (3, 3, "page")])
-        for c in Card.objects.filter(deck_id=res.json()["deck_id"]):
+        for c in Card.objects.filter(deck__public_id=res.json()["deck_id"]):
             self.assertEqual(c.page, excerpt_page(c))
 
     def test_estimated_ranges_only_without_page_metadata(self):
@@ -181,7 +179,7 @@ class SectionSourcingTests(PipelineTestCase):
             for user in users:
                 self.assertFalse(fact_pages(user))
                 self.assertNotRegex(user, r"(?m)^PAGE: ")
-        self.assertEqual({c.page for c in Card.objects.filter(deck_id=res.json()["deck_id"])}, {None})
+        self.assertEqual({c.page for c in Card.objects.filter(deck__public_id=res.json()["deck_id"])}, {None})
 
 
 class NoTocMergeTests(PipelineTestCase):
@@ -210,7 +208,7 @@ class PersistenceTests(PipelineTestCase):
         # 30 wanted, but only 3+3 facts exist outside "Cells" → global catch-up runs.
         res = self.generate(make_pdf(6, toc=UNEVEN_TOC), cards_wanted=30)
         self.assertEqual(res.status_code, 201, res.content)
-        cards = list(Card.objects.filter(deck_id=res.json()["deck_id"]))
+        cards = list(Card.objects.filter(deck__public_id=res.json()["deck_id"]))
         mixed = [c for c in cards if c.section == "Mixed topics"]
         self.assertTrue(mixed)
         self.assertEqual({c.page for c in mixed}, {None})
@@ -239,7 +237,9 @@ class RequestLimitTests(PipelineTestCase):
         per = {p["title"]: p for p in body["per_section"]}
         self.assertEqual(per["Cells"]["planned"], 8)
         self.assertEqual(per["Cells"]["created"], 8)
-        self.assertEqual(set(body), {"deck_id", "template", "cards_created", "requested", "warnings", "per_section"})
+        # F5 added `partial`; every F0.5 key is unchanged.
+        self.assertEqual(set(body), {"deck_id", "template", "cards_created", "requested", "partial",
+                                     "warnings", "per_section"})
 
 
 class TempAndErrorHygieneTests(PipelineTestCase):
@@ -249,12 +249,14 @@ class TempAndErrorHygieneTests(PipelineTestCase):
         self.assertEqual(list(pathlib.Path(self.tmpdir).iterdir()), [])
 
     def test_parse_errors_do_not_expose_server_paths(self):
+        # F5: a corrupt PDF is the client's input, so it is a 400 with a fixed
+        # message (F0.5 answered 500 with the sanitised exception text).
         for url in (ANALYZE, GENERATE):
             res = self.client.post(url, {"file": self.upload(b"%PDF-1.4 not really", "broken.pdf")},
                                    format="multipart")
-            self.assertEqual(res.status_code, 500)
+            self.assertEqual(res.status_code, 400)
+            self.assertEqual(res.json()["code"], "pdf_unreadable")
             detail = res.json()["detail"]
-            self.assertIn("broken.pdf", detail)
             self.assertNotIn(self.tmpdir, detail)
             self.assertNotIn(self.tmpdir.replace("\\", "/"), detail)
             self.assertNotIn("tmp", detail.replace(self.tmpdir, ""))
@@ -310,7 +312,7 @@ class ParaphrasedExcerptTests(PipelineTestCase):
                             allocations=self.allocations({"Cells": 4, "Photosynthesis": 2, "Respiration": 2}))
         self.assertEqual(res.status_code, 201, res.content)
         deck_id = res.json()["deck_id"]
-        pages = {(c.section, c.page) for c in Card.objects.filter(deck_id=deck_id)}
+        pages = {(c.section, c.page) for c in Card.objects.filter(deck__public_id=deck_id)}
         # Cells spans 1–4 → unknown (not page 1); single-page sections keep their page.
         self.assertEqual(pages, {("Cells", None), ("Photosynthesis", 5), ("Respiration", 6)})
         hand = self.client.get("/api/flashcards/hand/", {"deck_id": deck_id, "n": "all", "order": "doc"}).json()

@@ -302,7 +302,12 @@ def cards_from_document(
         seed_mixed = "\n".join(lines[:800])
         mix_text = _mix_text("", seed_mixed, MAX_CHARS_SINGLE)
         if mix_text:
-            extra = cards_from_chunk(mix_text, page_no=None, section="Mixed topics", max_cards=need)
+            try:
+                extra = cards_from_chunk(mix_text, page_no=None, section="Mixed topics", max_cards=need)
+            except Exception as e:
+                # Like a failed section job: keep the cards already made.
+                log.warning("core: catch-up failed: %s", e)
+                extra = []
             for c in extra or []:
                 front = (c.get("front") or "").strip()
                 back  = (c.get("back")  or "").strip()

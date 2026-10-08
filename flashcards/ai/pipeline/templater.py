@@ -110,7 +110,8 @@ def _ask_llm_sections(
 
     header_hint = "\n".join(header_lines) if header_lines else "(no hints)"
 
-    client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
+    client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", ""),
+                    timeout=getattr(settings, "OPENAI_TIMEOUT_SECONDS", 60))
     msg_user = _USER_TEMPLATE.format(header_hint=header_hint, body=text)
 
     try:

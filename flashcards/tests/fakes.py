@@ -45,6 +45,24 @@ def make_pdf(page_count: int, *, toc=None, facts_per_page: int = 3) -> bytes:
     return data
 
 
+def make_blank_pdf(page_count: int = 2) -> bytes:
+    """A valid PDF with no text at all (like a scanned document without OCR)."""
+    doc = fitz.open()
+    for _ in range(page_count):
+        doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def make_encrypted_pdf() -> bytes:
+    """A valid PDF that needs a user password to open."""
+    doc = fitz.open(stream=make_pdf(1), filetype="pdf")
+    data = doc.tobytes(encryption=fitz.PDF_ENCRYPT_AES_256, owner_pw="owner-pw", user_pw="user-pw")
+    doc.close()
+    return data
+
+
 def fact_pages(text: str) -> set[int]:
     return {int(m.group(1)) for m in FACT_RE.finditer(text or "")}
 
@@ -57,10 +75,15 @@ def _after(marker: str, text: str) -> str:
 class FakeOpenAI:
     """Deterministic stand-in for `openai.OpenAI` (chat.completions only)."""
 
-    def __init__(self, *, notoc_titles: dict[int, str] | None = None, paraphrase: bool = False):
+    def __init__(self, *, notoc_titles: dict[int, str] | None = None, paraphrase: bool = False,
+                 empty_sections: set[str] = frozenset(), fail: set[str] = frozenset()):
         self.calls: list[dict] = []
         self.notoc_titles = notoc_titles or {}
         self.paraphrase = paraphrase  # excerpts that cannot be found verbatim
+        # Sections (by SECTION: line; "Mixed topics" = catch-up) answered with no cards.
+        self.empty_sections = set(empty_sections)
+        # Request kinds ("template", "cards", "Mixed topics") that raise like an API outage.
+        self.fail = set(fail)
         self._served: dict[tuple, int] = defaultdict(int)
         self._lock = threading.Lock()
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
@@ -69,12 +92,15 @@ class FakeOpenAI:
     def _create(self, *, model, messages, **_kw):
         system = messages[0]["content"]
         user = messages[1]["content"]
-        if "study-note generator" in system:
-            kind, payload = "template", self._template(user)
-        elif "flash-card author" in system:
-            kind, payload = "cards", self._cards(system, user)
-        else:
+        kind = "template" if "study-note generator" in system else "cards" if "flash-card author" in system else None
+        if kind is None:
             raise AssertionError(f"unexpected prompt: {system[:80]!r}")
+        section_m = re.search(r"^SECTION: (.+)$", user, re.M)
+        if kind in self.fail or (section_m and section_m.group(1) in self.fail):
+            import httpx
+            import openai
+            raise openai.APIConnectionError(request=httpx.Request("POST", "https://fake.invalid/v1/chat/completions"))
+        payload = self._template(user) if kind == "template" else self._cards(system, user)
         with self._lock:
             self.calls.append({"kind": kind, "user": user})
         content = json.dumps(payload)
@@ -101,6 +127,8 @@ class FakeOpenAI:
         section_m = re.search(r"^SECTION: (.+)$", user, re.M)
         section = section_m.group(1) if section_m else None
         body = _after("\nTEXT:\n", user)
+        if section in self.empty_sections:
+            return {"cards": []}
 
         facts = [(m.group(0), m.group(1), m.group(2), m.group(3)) for m in FACT_RE.finditer(body)]
         if facts:

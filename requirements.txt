@@ -1,21 +1,22 @@
+# Supported Python: 3.10–3.14 (the intersection of the pins below; verified
+# on 3.14). See README.md, "Python and Django support".
+
 # ── Django + DRF ─────────────────────────────────────────────────────────────
-Django==5.0.4
-djangorestframework==3.16.0
-django-cors-headers==4.4.0     # (optional) if you enable CORS
+Django==5.2.18                   # 5.2 LTS (security support to April 2028)
+djangorestframework==3.17.2
+django-cors-headers==4.8.0
 
 # ── OpenAI ───────────────────────────────────────────────────────────────────
 openai==1.96.1
-# tiktoken intentionally not pinned: its only importer is the unused
-# flashcards/ai/chunker.py, and tiktoken==0.7.0 has no wheel for Python 3.14.
-python-decouple==3.8             # for OPENAI_API_KEY, etc.
+python-decouple==3.8             # settings from the environment / .env
 
-# ── PDF / OCR pipeline ───────────────────────────────────────────────────────
-pymupdf==1.26.3                  # PyMuPDF: fast PDF text & images
-Pillow==11.3.0                   # image IO for OCR
-pytesseract==0.3.13              # wraps the Tesseract binary (install OS package too)
+# ── PDF ──────────────────────────────────────────────────────────────────────
+pymupdf==1.26.3                  # PyMuPDF: PDF text, outline and page count
 
-# ── DOCX support (your code imports python_docx/python-docx) ────────────────
-python-docx==1.1.2               # package name uses a dash on PyPI
+# Removed in F5 (no module imported them): Pillow, pytesseract and
+# python-docx (OCR / DOCX were never wired up). The dead modules
+# ai/chunker.py (tiktoken), ai/ingest.py, ai/prompt_cards.py (genanki,
+# fastapi) and the empty flashcards/inspect.py were deleted too.
 
 # ── (optional) production helpers ────────────────────────────────────────────
 # gunicorn==21.2.0               # WSGI server (Linux/macOS)

@@ -21,3 +21,9 @@ urlpatterns = [
     #path("admin/", admin.site.urls),
     path("api/flashcards/", include("flashcards.urls")),
 ]
+
+# JSON (not HTML) for errors raised outside the API views, when DEBUG is off.
+handler400 = "flashcards.errors.bad_request"
+handler403 = "flashcards.errors.forbidden"
+handler404 = "flashcards.errors.not_found"
+handler500 = "flashcards.errors.server_error"

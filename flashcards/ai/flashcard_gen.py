@@ -5,7 +5,9 @@ from openai import OpenAI
 from django.conf import settings
 
 log = logging.getLogger(__name__)
-CLIENT = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
+# A missing key is allowed at import time; views refuse to generate without one.
+CLIENT = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", ""),
+                timeout=getattr(settings, "OPENAI_TIMEOUT_SECONDS", 60))
 
 _KEY_RE = re.compile(r"[^a-z0-9]+")
 def build_card_key(front: str, back: str) -> str:
